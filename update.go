@@ -154,6 +154,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "d":
 		m.filters.ShowDev = !m.filters.ShowDev
 		m.rebuildRows()
+	case "t":
+		m.filters.ShowTUI = !m.filters.ShowTUI
+		m.rebuildRows()
 
 	case "i":
 		m.icons = !m.icons

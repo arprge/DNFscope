@@ -238,7 +238,7 @@ func (m model) tabsRow() string {
 	for _, f := range []struct {
 		key string
 		on  bool
-	}{{"all", m.filters.AllUser}, {"base", m.filters.IncludeBase}, {"dev", m.filters.ShowDev}} {
+	}{{"all", m.filters.AllUser}, {"base", m.filters.IncludeBase}, {"dev", m.filters.ShowDev}, {"tui", m.filters.ShowTUI}} {
 		st := paint(theme.overlay0, bg)
 		if f.on {
 			st = paint(theme.green, bg)
@@ -499,6 +499,7 @@ func (m model) footerRow() string {
 			{"a", "all", m.filters.AllUser},
 			{"b", "base", m.filters.IncludeBase},
 			{"d", "dev", m.filters.ShowDev},
+			{"t", "tui", m.filters.ShowTUI},
 			{"i", "icons", m.icons},
 			{"q", "quit", false},
 		}
@@ -550,6 +551,7 @@ func (m model) helpPanel(h int) []string {
 		row("a", "include non-tool packages"),
 		row("b", "include base image"),
 		row("d", "include -devel / -doc"),
+		row("t", "include terminal UI apps"),
 		row("i", "toggle icons"),
 		row("q", "quit"),
 	}

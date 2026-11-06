@@ -17,6 +17,7 @@ type Package struct {
 	FromBase        bool      `json:"from_base"`
 	DevNoise        bool      `json:"dev_noise"`
 	SystemComponent bool      `json:"system_component"`
+	TUI             bool      `json:"tui"`
 }
 
 func (p Package) KindLabel() string {
@@ -35,6 +36,7 @@ type Filters struct {
 	AllUser     bool // show every user package, including fonts/themes/libs
 	IncludeBase bool // show packages from the base image transactions
 	ShowDev     bool // show -devel/-doc/-static noise
+	ShowTUI     bool // show terminal UI apps (tui-tools family)
 }
 
 type SortMode int

@@ -114,6 +114,9 @@ func (m *model) rebuildRows() {
 		if !m.filters.ShowDev && p.DevNoise {
 			continue
 		}
+		if !m.filters.ShowTUI && p.TUI {
+			continue
+		}
 		if !m.filters.AllUser && p.SystemComponent {
 			continue
 		}

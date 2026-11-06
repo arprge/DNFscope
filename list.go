@@ -38,7 +38,7 @@ func runList(w io.Writer) error {
 
 	shown := 0
 	for _, p := range pkgs {
-		if p.FromBase || p.DevNoise || p.SystemComponent || (!p.HasDesktop && len(p.Commands) == 0) {
+		if p.FromBase || p.DevNoise || p.SystemComponent || p.TUI || (!p.HasDesktop && len(p.Commands) == 0) {
 			continue
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
