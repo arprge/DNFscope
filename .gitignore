@@ -1,1 +1,6 @@
-dnf-tui
+# Generated executables
+/dnf-tui
+/dnfscope
+
+# Local Go build cache
+/.go-cache/
