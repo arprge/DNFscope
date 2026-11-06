@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,17 +27,15 @@ const (
 	emptyRPMDB = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 	// One rpm call yields metadata plus every file owned by every package.
-	rpmQueryFormat = "\x01%{NAME}\t%{ARCH}\t%{VERSION}-%{RELEASE}\t%{SIZE}\t%{INSTALLTIME}\t%{SUMMARY}\t%{URL}\n[%{FILENAMES}\n]"
+	rpmQueryFormat = "\x01%{NAME}\t%{ARCH}\t%{VERSION}-%{RELEASE}\t%{SIZE}\t%{INSTALLTIME}\t%{SUMMARY}\t%{URL}\n[%{FILENAMES}\t%{FILEMODES}\n]"
 )
 
 var (
-	reasonLineRe  = regexp.MustCompile(`^"([^"]+)" = \{reason = "([^"]+)"\}$`)
-	devNameRe     = regexp.MustCompile(`(?i)-(devel|static|headers|debuginfo|debugsource|docs?|langpacks?.*|libs)$`)
-	devSummaryRe  = regexp.MustCompile(`(?i)^(development files|header files|libraries and headers|static libraries|documentation for|language packs)`)
-	binPathRe     = regexp.MustCompile(`^/usr/(?:(?:s?bin|local/bin)/[^/]+|libexec/git-core/[^/]+)$`)
-	nevraRe       = regexp.MustCompile(`^(.*)-(\d+):(.*)\.([^.]+)$`)
-	baseDescRe    = regexp.MustCompile(`(?i)(--installroot|kiwi|anaconda|installer|livecd)`)
-	rpmdbCookieRe = regexp.MustCompile(`rpmdb_cookie\s*=\s*"([^"]+)"`)
+	reasonLineRe = regexp.MustCompile(`^"([^"\\]+)"\s*=\s*\{\s*reason\s*=\s*"([^"\\]+)"\s*,?\s*\}\s*(?:#.*)?$`)
+	devNameRe    = regexp.MustCompile(`(?i)-(devel|static|headers|debuginfo|debugsource|docs?|langpacks?.*|libs)$`)
+	devSummaryRe = regexp.MustCompile(`(?i)^(development files|header files|libraries and headers|static libraries|documentation for|language packs)`)
+	binPathRe    = regexp.MustCompile(`^/(?:usr/(?:local/)?)?s?bin/[^/]+$`)
+	nevraRe      = regexp.MustCompile(`^([A-Za-z0-9+_.-]+)-(?:[0-9]+:)?([^-:]+)-([^-:]+)\.([^.]+)$`)
 )
 
 func isUserReason(r string) bool {
@@ -44,7 +43,7 @@ func isUserReason(r string) bool {
 }
 
 // loadReasons reads the per-package install reason written by libdnf5.
-// The file is a flat TOML table: "name.arch" = {reason = "User"}.
+// libdnf5 writes "name.arch" = {reason = "User"} under [packages].
 func loadReasons() (map[string]string, error) {
 	f, err := os.Open(filepath.Join(libdnfDir, "packages.toml"))
 	if err != nil {
@@ -52,33 +51,101 @@ func loadReasons() (map[string]string, error) {
 	}
 	defer f.Close()
 
-	reasons := make(map[string]string, 4096)
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		if m := reasonLineRe.FindStringSubmatch(sc.Text()); m != nil {
-			reasons[m[1]] = m[2]
-		}
-	}
-	return reasons, sc.Err()
+	return parseReasons(f)
 }
 
-// fingerprint changes whenever the rpmdb or dnf5's stored reasons change, so a
-// cached result can be trusted without re-scanning.
-func fingerprint() (string, error) {
-	h := sha256.New()
-	cookie := ""
-	if b, err := os.ReadFile(filepath.Join(libdnfDir, "system.toml")); err == nil {
-		if m := rpmdbCookieRe.FindSubmatch(b); m != nil {
-			cookie = string(m[1])
+// Parse libdnf5's generated TOML subset, not arbitrary TOML. Unsupported records
+// must fail rather than silently turning user packages into dependencies.
+func parseReasons(r io.Reader) (map[string]string, error) {
+	reasons := make(map[string]string, 4096)
+	sc := bufio.NewScanner(r)
+	inPackages, foundPackages := false, false
+	lineNo := 0
+	for sc.Scan() {
+		lineNo++
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
 		}
+		if strings.HasPrefix(line, "[") {
+			section := strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
+			inPackages = section == "[packages]"
+			foundPackages = foundPackages || inPackages
+			continue
+		}
+		if !inPackages {
+			continue
+		}
+		m := reasonLineRe.FindStringSubmatch(line)
+		if m == nil {
+			return nil, fmt.Errorf("packages.toml line %d: unsupported package reason record", lineNo)
+		}
+		if _, exists := reasons[m[1]]; exists {
+			return nil, fmt.Errorf("packages.toml line %d: duplicate package %q", lineNo, m[1])
+		}
+		reasons[m[1]] = m[2]
 	}
-	fmt.Fprintf(h, "cookie=%s", cookie)
-	for _, name := range []string{"packages.toml", "nevras.toml"} {
-		st, err := os.Stat(filepath.Join(libdnfDir, name))
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if !foundPackages {
+		return nil, fmt.Errorf("packages.toml: missing [packages] table")
+	}
+	return reasons, nil
+}
+
+// DNF's stored cookie does not change after a direct rpm transaction. Inspect
+// the actual rpmdb too, and history (including SQLite's WAL) used by the baseline.
+func fingerprint() (string, error) {
+	out, err := runCmd(context.Background(), "rpm", "--eval", "%{_dbpath}")
+	if err != nil {
+		return "", err
+	}
+	dbDir := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(dbDir) {
+		return "", fmt.Errorf("rpm returned invalid database path %q", dbDir)
+	}
+	return fingerprintDirs(libdnfDir, dbDir)
+}
+
+func fingerprintDirs(stateDir, dbDir string) (string, error) {
+	h := sha256.New()
+	for _, name := range []string{"system.toml", "packages.toml", "nevras.toml"} {
+		b, err := os.ReadFile(filepath.Join(stateDir, name))
 		if err != nil {
 			return "", err
 		}
-		fmt.Fprintf(h, "|%s:%d:%d", name, st.Size(), st.ModTime().UnixNano())
+		fmt.Fprintf(h, "%s:%d:", name, len(b))
+		h.Write(b)
+	}
+	paths := []string{
+		filepath.Join(stateDir, "transaction_history.sqlite"),
+		filepath.Join(stateDir, "transaction_history.sqlite-wal"),
+	}
+	dbFound := false
+	for _, name := range []string{"rpmdb.sqlite", "Packages", "data.mdb"} {
+		path := filepath.Join(dbDir, name)
+		if _, err := os.Stat(path); err == nil {
+			dbFound = true
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		paths = append(paths, path)
+	}
+	if !dbFound {
+		return "", fmt.Errorf("no supported RPM database in %s", dbDir)
+	}
+	paths = append(paths, filepath.Join(dbDir, "rpmdb.sqlite-wal"))
+	for _, path := range paths {
+		st, err := os.Stat(path)
+		if os.IsNotExist(err) {
+			fmt.Fprintf(h, "|%s:missing", path)
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(h, "|%s:%d:%d", path, st.Size(), st.ModTime().UnixNano())
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -106,17 +173,25 @@ type histInfo struct {
 	ID          int    `json:"id"`
 	Description string `json:"description"`
 	RPMDBBegin  string `json:"rpmdb_version_begin"`
+	Status      string `json:"status"`
 	Packages    []struct {
-		NEVRA string `json:"nevra"`
+		NEVRA  string `json:"nevra"`
+		Action string `json:"action"`
 	} `json:"packages"`
 }
 
 // loadBaseNames returns the name.arch keys installed by the base image
 // transactions. The lowest transaction is only trusted when it started from an
 // empty rpmdb (i.e. the system installer); image builds add a few consecutive
-// --installroot transactions after it.
+// installroot or KIWI-configured transactions after it.
 func loadBaseNames(ctx context.Context) (map[string]struct{}, bool, error) {
-	out, err := runCmd(ctx, "dnf", "history", "list", "--json")
+	return loadBaseNamesWith(ctx, runCmd)
+}
+
+type commandRunner func(context.Context, string, ...string) ([]byte, error)
+
+func loadBaseNamesWith(ctx context.Context, run commandRunner) (map[string]struct{}, bool, error) {
+	out, err := run(ctx, "dnf5", "history", "list", "--json")
 	if err != nil {
 		return nil, false, err
 	}
@@ -135,23 +210,26 @@ func loadBaseNames(ctx context.Context) (map[string]struct{}, bool, error) {
 	}
 	sort.Ints(ids)
 
-	first, err := historyInfo(ctx, ids[0])
+	first, err := historyInfoWith(ctx, ids[0], run)
 	if err != nil {
 		return nil, false, err
 	}
-	if first.RPMDBBegin != emptyRPMDB {
+	if first.RPMDBBegin != emptyRPMDB || first.Status != "Ok" {
 		return nil, false, nil // history was rotated; no reliable baseline
 	}
 
 	base := make(map[string]struct{}, 2048)
 	addBaseNames(base, first)
 	for i := 1; i < len(ids) && i <= 3 && ids[i] == ids[i-1]+1; i++ {
-		info, err := historyInfo(ctx, ids[i])
+		info, err := historyInfoWith(ctx, ids[i], run)
 		if err != nil {
+			return nil, false, err
+		}
+		if !isImageBuild(info.Description) {
 			break
 		}
-		if !baseDescRe.MatchString(info.Description) {
-			break
+		if info.Status != "Ok" {
+			return nil, false, fmt.Errorf("image transaction %d has status %q", info.ID, info.Status)
 		}
 		addBaseNames(base, info)
 	}
@@ -159,7 +237,11 @@ func loadBaseNames(ctx context.Context) (map[string]struct{}, bool, error) {
 }
 
 func historyInfo(ctx context.Context, id int) (histInfo, error) {
-	out, err := runCmd(ctx, "dnf", "history", "info", strconv.Itoa(id), "--json")
+	return historyInfoWith(ctx, id, runCmd)
+}
+
+func historyInfoWith(ctx context.Context, id int, run commandRunner) (histInfo, error) {
+	out, err := run(ctx, "dnf5", "history", "info", strconv.Itoa(id), "--json")
 	if err != nil {
 		return histInfo{}, err
 	}
@@ -167,15 +249,53 @@ func historyInfo(ctx context.Context, id int) (histInfo, error) {
 	if err := json.Unmarshal(out, &infos); err != nil {
 		return histInfo{}, err
 	}
-	if len(infos) == 0 {
-		return histInfo{}, fmt.Errorf("dnf history info %d: empty result", id)
+	if len(infos) != 1 || infos[0].ID != id {
+		return histInfo{}, fmt.Errorf("dnf5 history info %d: unexpected result", id)
 	}
 	return infos[0], nil
 }
 
+// Match image-builder options, not package names such as anaconda or installer.
+func isImageBuild(description string) bool {
+	args := strings.Fields(description)
+	for i, arg := range args {
+		if arg == "--" {
+			break
+		}
+		if strings.HasPrefix(arg, "--installroot=") && len(arg) > len("--installroot=") {
+			return true
+		}
+		if arg == "--installroot" && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			return true
+		}
+		config := ""
+		if strings.HasPrefix(arg, "--config=") {
+			config = strings.TrimPrefix(arg, "--config=")
+		} else if (arg == "--config" || arg == "-c") && i+1 < len(args) {
+			config = args[i+1]
+		}
+		if filepath.Base(strings.Trim(config, "\"'")) == "kiwi_dnf5.config" {
+			return true
+		}
+	}
+	return false
+}
+
 func addBaseNames(base map[string]struct{}, info histInfo) {
+	// Process outgoing records first: upgrades can contain Replaced and Upgrade
+	// entries with the same name.arch, in either order.
 	for _, p := range info.Packages {
-		base[nevraKey(p.NEVRA)] = struct{}{}
+		if p.Action == "Remove" || p.Action == "Replaced" {
+			delete(base, nevraKey(p.NEVRA))
+		}
+	}
+	for _, p := range info.Packages {
+		switch p.Action {
+		case "Install", "Upgrade", "Downgrade", "Reinstall":
+			if key := nevraKey(p.NEVRA); key != "" {
+				base[key] = struct{}{}
+			}
+		}
 	}
 }
 
@@ -183,7 +303,7 @@ func nevraKey(nevra string) string {
 	if m := nevraRe.FindStringSubmatch(nevra); m != nil {
 		return m[1] + "." + m[4]
 	}
-	return nevra
+	return ""
 }
 
 // buildPackages scans the rpmdb once and keeps only packages the user asked for.
@@ -218,6 +338,7 @@ func buildPackages(ctx context.Context) ([]Package, bool, error) {
 		}
 		p.DevNoise = devNameRe.MatchString(p.Name) || devSummaryRe.MatchString(p.Summary)
 		p.SystemComponent = isSystemComponent(p.Name)
+		p.TUI = isTUI(p.Name, p.Commands)
 	}
 
 	sort.SliceStable(pkgs, func(i, j int) bool { return pkgs[i].InstallTime.After(pkgs[j].InstallTime) })
@@ -257,16 +378,37 @@ func scanRPM(ctx context.Context, reasons map[string]string, base map[string]str
 		return nil, fmt.Errorf("start rpm: %w", err)
 	}
 
+	out, scanErr := parseRPM(stdout, reasons, base, executableFile)
+	// A parser error may leave rpm blocked writing to its pipe.
+	if scanErr != nil {
+		cancel()
+	}
+	waitErr := cmd.Wait()
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	if waitErr != nil {
+		return nil, fmt.Errorf("rpm -qa: %w", waitErr)
+	}
+	return out, nil
+}
+
+func parseRPM(r io.Reader, reasons map[string]string, base map[string]struct{}, executable func(string) bool) ([]Package, error) {
 	out := make([]Package, 0, 256)
 	idx := -1 // index of the package currently receiving files
-	sc := bufio.NewScanner(stdout)
+	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
 	for sc.Scan() {
 		line := sc.Text()
 
 		if strings.HasPrefix(line, "/") {
 			if idx >= 0 {
-				addFile(&out[idx], line)
+				path, modeText, ok := strings.Cut(line, "\t")
+				mode, err := strconv.ParseUint(modeText, 10, 32)
+				if !ok || err != nil {
+					return nil, fmt.Errorf("rpm: invalid file mode record %q", line)
+				}
+				addFile(&out[idx], path, mode, executable)
 			}
 			continue
 		}
@@ -299,13 +441,8 @@ func scanRPM(ctx context.Context, reasons map[string]string, base map[string]str
 		})
 		idx = len(out) - 1
 	}
-	scanErr := sc.Err()
-	waitErr := cmd.Wait()
-	if scanErr != nil {
-		return nil, scanErr
-	}
-	if waitErr != nil {
-		return nil, fmt.Errorf("rpm -qa: %w", waitErr)
+	if err := sc.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -315,11 +452,25 @@ func isBase(base map[string]struct{}, key string) bool {
 	return ok
 }
 
-func addFile(p *Package, path string) {
+func executableFile(path string) bool {
+	st, err := os.Stat(path) // follow symlinks, including targets owned by other RPMs
+	return err == nil && st.Mode().IsRegular() && st.Mode().Perm()&0o111 != 0
+}
+
+func addFile(p *Package, path string, mode uint64, executable func(string) bool) {
 	if !p.HasDesktop && strings.HasSuffix(path, ".desktop") && strings.Contains(path, "/share/applications/") {
 		p.HasDesktop = true
 	}
-	if binPathRe.MatchString(path) {
+	if !binPathRe.MatchString(path) {
+		return
+	}
+	const fileType = 0o170000
+	regularExecutable := mode&fileType == 0o100000 && mode&0o111 != 0
+	// Alternatives-managed %ghost files can be recorded as non-executable
+	// regular files even though their installed paths are executable symlinks.
+	checkInstalled := mode&fileType == 0o120000 || mode&fileType == 0o100000 && !regularExecutable
+	installedExecutable := checkInstalled && executable(path)
+	if regularExecutable || installedExecutable {
 		p.Commands = append(p.Commands, filepath.Base(path))
 	}
 }

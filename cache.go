@@ -7,7 +7,8 @@ import (
 	"path/filepath"
 )
 
-const cacheSchema = 2
+// Bump when derived detection rules change, even if the JSON shape does not.
+const cacheSchema = 4
 
 type cacheFile struct {
 	Schema      int       `json:"schema"`
@@ -57,8 +58,19 @@ func writeCache(cf *cacheFile) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	// Separate writers must not share a temporary file: concurrent scans could
+	// otherwise rename a partially overwritten cache into place.
+	f, err := os.CreateTemp(filepath.Dir(path), "packages-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
