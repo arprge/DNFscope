@@ -48,7 +48,7 @@ func boolInt(b bool) int {
 	return 0
 }
 
-func computeLayout(w, h int, icons bool) layout {
+func computeLayout(w, h int, icons bool, splitW, stackDetailH int) layout {
 	if w < minWidth {
 		w = minWidth
 	}
@@ -64,7 +64,10 @@ func computeLayout(w, h int, icons bool) layout {
 	switch {
 	case w >= splitMinW && l.avail >= 10:
 		l.mode = modeSplit
-		l.detW = clamp(w*40/100, 32, 56)
+		if splitW == 0 {
+			splitW = w * 40 / 100
+		}
+		l.detW = clamp(splitW, 32, min(56, w-40))
 		l.listW = w - l.detW
 		l.listH = l.avail
 		l.detH = l.avail
@@ -75,10 +78,13 @@ func computeLayout(w, h int, icons bool) layout {
 	case l.avail >= 14:
 		l.mode = modeStack
 		l.detW = w
-		l.detH = 6
-		if l.avail >= 18 {
-			l.detH = 8
+		if stackDetailH == 0 {
+			stackDetailH = 6
+			if l.avail >= 18 {
+				stackDetailH = 8
+			}
 		}
+		l.detH = clamp(stackDetailH, 6, l.avail-6)
 		l.listW = w
 		l.listH = l.avail - l.detH
 	default:

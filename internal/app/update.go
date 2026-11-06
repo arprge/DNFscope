@@ -32,6 +32,13 @@ type copyDoneMsg struct {
 }
 type clearNoticeMsg string
 
+type pane int
+
+const (
+	paneList pane = iota
+	paneDetails
+)
+
 func spinnerTick() tea.Cmd {
 	return tea.Tick(80*time.Millisecond, func(time.Time) tea.Msg { return spinnerMsg{} })
 }
@@ -49,6 +56,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.resize(msg.Width, msg.Height)
 		return m, nil
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
 
 	case spinnerMsg:
 		if !m.loading {
@@ -128,6 +138,81 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.help || m.searching {
+		return m, nil
+	}
+
+	if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+		delta := 1
+		if msg.Button == tea.MouseButtonWheelUp {
+			delta = -1
+		}
+		if m.showDeps && m.focused == paneDetails {
+			m.moveDependencies(delta)
+		} else {
+			m.move(delta)
+		}
+		return m, nil
+	}
+
+	if msg.Action == tea.MouseActionRelease {
+		m.dragging = false
+		return m, nil
+	}
+	if msg.Action == tea.MouseActionMotion && m.dragging {
+		switch m.lay.mode {
+		case modeSplit:
+			m.splitW = m.width - msg.X
+		case modeStack:
+			m.stackDetailH = m.lay.avail - (msg.Y - m.contentStartY())
+		}
+		m.resize(m.width, m.height)
+		return m, nil
+	}
+	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
+		return m, nil
+	}
+
+	switch m.lay.mode {
+	case modeSplit:
+		if abs(msg.X-m.lay.listW) <= 1 {
+			m.dragging = true
+			return m, nil
+		}
+		if msg.X < m.lay.listW {
+			m.focused = paneList
+		} else {
+			m.focused = paneDetails
+		}
+	case modeStack:
+		boundaryY := m.contentStartY() + m.lay.listH
+		if abs(msg.Y-boundaryY) <= 1 {
+			m.dragging = true
+			return m, nil
+		}
+		if msg.Y < boundaryY {
+			m.focused = paneList
+		} else {
+			m.focused = paneDetails
+		}
+	default:
+		m.focused = paneList
+	}
+	return m, nil
+}
+
+func (m model) contentStartY() int {
+	return 1 + boolInt(m.lay.searchRow) + boolInt(m.lay.tabsRow) + boolInt(m.lay.contentGap)
+}
+
+func abs(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {

@@ -14,6 +14,10 @@ type model struct {
 
 	width, height int
 	lay           layout
+	focused       pane
+	dragging      bool
+	splitW        int
+	stackDetailH  int
 	icons         bool
 	repoSource    bool
 	repoLoading   bool
@@ -115,7 +119,12 @@ func loadRepoSources(pkgs []Package) tea.Cmd {
 
 func (m *model) resize(width, height int) {
 	m.width, m.height = width, height
-	m.lay = computeLayout(width, height, m.icons)
+	m.lay = computeLayout(width, height, m.icons, m.splitW, m.stackDetailH)
+	if m.lay.mode == modeSplit {
+		m.splitW = m.lay.detW
+	} else if m.lay.mode == modeStack {
+		m.stackDetailH = m.lay.detH
+	}
 	m.clampScroll()
 }
 
