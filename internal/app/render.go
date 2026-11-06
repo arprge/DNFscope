@@ -252,7 +252,7 @@ func (m model) tabsRow() string {
 
 // --- list ----------------------------------------------------------------
 
-func (m model) listPanel() []string {
+func (m model) listPanel(active bool) []string {
 	l := m.lay
 	bg := theme.base
 	inner := l.listInnerW
@@ -284,7 +284,7 @@ func (m model) listPanel() []string {
 	if len(m.visible) > 0 {
 		pos = fmt.Sprintf("%d/%d", m.cursor+1, len(m.visible))
 	}
-	return panel("Packages", pos, l.listW, l.listH, true, body)
+	return panel("Packages", pos, l.listW, l.listH, active, body)
 }
 
 func (m model) packageRow(idx int) string {
@@ -367,15 +367,15 @@ func kv(label, value string, valueStyle lipgloss.Style, w int) string {
 	})
 }
 
-func (m model) detailPanel(w, h int) []string {
+func (m model) detailPanel(w, h int, active bool) []string {
 	bg := theme.base
 	inner := w - 2
 	p, ok := m.selected()
 	if !ok {
-		return panel("Details", "", w, h, false, []string{centered(inner, "nothing selected", theme.overlay0, bg)})
+		return panel("Details", "", w, h, active, []string{centered(inner, "nothing selected", theme.overlay0, bg)})
 	}
 	if m.showDeps {
-		return m.dependenciesPanel(p, w, h)
+		return m.dependenciesPanel(p, w, h, active)
 	}
 
 	accent := kindColor(p.KindLabel())
@@ -419,31 +419,31 @@ func (m model) detailPanel(w, h int) []string {
 	if p.URL != "" {
 		lines = append(lines, kv("url", p.URL, paint(theme.sapphire, bg), inner))
 	}
-	return panel("Details", "", w, h, false, lines)
+	return panel("Details", "", w, h, active, lines)
 }
 
-func (m model) dependenciesPanel(p Package, w, h int) []string {
+func (m model) dependenciesPanel(p Package, w, h int, active bool) []string {
 	bg := theme.base
 	inner := w - 2
 	key := packageKey(p)
 	if m.depsLoading == key {
-		return panel("Requirements", "loading…", w, h, false, []string{
+		return panel("Requirements", "loading…", w, h, active, []string{
 			centered(inner, "reading installed package requirements…", theme.overlay0, bg),
 		})
 	}
 	result, ok := m.deps[key]
 	if !ok {
-		return panel("Requirements", "", w, h, false, []string{
+		return panel("Requirements", "", w, h, active, []string{
 			centered(inner, "select this package and press r", theme.overlay0, bg),
 		})
 	}
 	if result.err != nil {
-		return panel("Requirements", "error", w, h, false, []string{
+		return panel("Requirements", "error", w, h, active, []string{
 			" " + paint(theme.red, bg).Render(result.err.Error()),
 		})
 	}
 	if len(result.lines) == 0 {
-		return panel("Requirements", "0", w, h, false, []string{
+		return panel("Requirements", "0", w, h, active, []string{
 			centered(inner, "no non-RPM-library requirements", theme.overlay0, bg),
 		})
 	}
@@ -456,7 +456,7 @@ func (m model) dependenciesPanel(p Package, w, h int) []string {
 		lines = append(lines, "  "+paint(theme.text, bg).Render(requirement))
 	}
 	right := fmt.Sprintf("%d–%d / %d", offset+1, end, len(result.lines))
-	return panel("Requirements", right, w, h, false, lines)
+	return panel("Requirements", right, w, h, active, lines)
 }
 
 // --- overview ------------------------------------------------------------

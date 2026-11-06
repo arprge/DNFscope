@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -122,7 +123,7 @@ func TestDetailPanelShowsInstallRepository(t *testing.T) {
 			m.all = []Package{{Name: "example", Arch: "x86_64", EVR: "1.0", Repo: test.repo, Commands: []string{"example"}}}
 			m.rebuildRows()
 
-			lines := strings.Join(m.detailPanel(80, 20), "\n")
+			lines := strings.Join(m.detailPanel(80, 20, false), "\n")
 			plain := ansi.Strip(lines)
 			if !strings.Contains(plain, "installed") || !strings.Contains(plain, test.repo) {
 				t.Fatalf("detail panel does not show install source %q:\n%s", test.repo, plain)
@@ -149,6 +150,45 @@ func TestScrollWindow(t *testing.T) {
 	m.jump(0)
 	if m.offset != 0 {
 		t.Fatalf("offset=%d after jump top", m.offset)
+	}
+}
+
+func TestMouseFocusAndResize(t *testing.T) {
+	m := baseModel(false)
+	m.loading = false
+	m.all = testPackages()
+	m.rebuildRows()
+
+	if m.lay.mode != modeSplit {
+		t.Fatalf("initial mode=%v, want split", m.lay.mode)
+	}
+	applyMouse := func(msg tea.MouseMsg) {
+		updated, _ := m.Update(msg)
+		m = updated.(model)
+	}
+	oldDetailW := m.lay.detW
+	applyMouse(tea.MouseMsg{X: m.lay.listW + 2, Y: m.contentStartY(), Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	if m.focused != paneDetails {
+		t.Fatal("clicking the detail pane did not focus it")
+	}
+	applyMouse(tea.MouseMsg{X: m.lay.listW, Y: m.contentStartY(), Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	applyMouse(tea.MouseMsg{X: m.lay.listW - 8, Y: m.contentStartY(), Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
+	applyMouse(tea.MouseMsg{X: m.lay.listW - 8, Y: m.contentStartY(), Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
+	if m.lay.detW != oldDetailW+8 {
+		t.Fatalf("dragged detail width=%d, want %d", m.lay.detW, oldDetailW+8)
+	}
+
+	m.resize(60, 20)
+	if m.lay.mode != modeStack {
+		t.Fatalf("stack test mode=%v, want stack", m.lay.mode)
+	}
+	oldDetailH := m.lay.detH
+	boundaryY := m.contentStartY() + m.lay.listH
+	applyMouse(tea.MouseMsg{X: 10, Y: boundaryY, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	applyMouse(tea.MouseMsg{X: 10, Y: boundaryY - 2, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
+	applyMouse(tea.MouseMsg{X: 10, Y: boundaryY - 2, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
+	if m.lay.detH != oldDetailH+2 {
+		t.Fatalf("dragged detail height=%d, want %d", m.lay.detH, oldDetailH+2)
 	}
 }
 
