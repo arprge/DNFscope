@@ -15,6 +15,8 @@ type model struct {
 	width, height int
 	lay           layout
 	icons         bool
+	repoSource    bool
+	repoLoading   bool
 
 	cursor int
 	offset int
@@ -24,7 +26,7 @@ type model struct {
 	sortMode SortMode
 	sortDesc bool
 	kind     KindFilter
-	counts   [4]int // per type, before the type tab is applied
+	counts   [kindCount]int // per type, before the type tab is applied
 
 	searching bool
 	help      bool
@@ -36,6 +38,12 @@ type model struct {
 	spin    int
 	caretOn bool
 	flash   bool
+	notice  string
+
+	showDeps    bool
+	depsLoading string
+	depsOffset  int
+	deps        map[string]dependencyResult
 }
 
 // baseModel builds a model with no cache access; tests use it directly.
@@ -45,6 +53,7 @@ func baseModel(icons bool) model {
 		sortMode: SortDate,
 		sortDesc: true,
 		loading:  true,
+		deps:     make(map[string]dependencyResult),
 	}
 	m.resize(100, 30)
 	return m
@@ -65,7 +74,7 @@ func newModel(icons bool) model {
 }
 
 func (m model) Init() tea.Cmd {
-	cmds := []tea.Cmd{refreshCmd(m.fp, len(m.all) > 0)}
+	cmds := []tea.Cmd{refreshCmd(m.fp, len(m.all) > 0, m.repoSource)}
 	if m.loading {
 		cmds = append(cmds, spinnerTick())
 	}
@@ -73,7 +82,7 @@ func (m model) Init() tea.Cmd {
 }
 
 // refreshCmd validates the cache fingerprint and re-scans only when needed.
-func refreshCmd(oldFP string, hasData bool) tea.Cmd {
+func refreshCmd(oldFP string, hasData, includeRepos bool) tea.Cmd {
 	return func() tea.Msg {
 		fp, err := fingerprint()
 		if err != nil {
@@ -83,7 +92,7 @@ func refreshCmd(oldFP string, hasData bool) tea.Cmd {
 			return scanDoneMsg{fp: fp, cached: true}
 		}
 
-		pkgs, baseFound, err := buildPackages(context.Background())
+		pkgs, baseFound, err := buildPackages(context.Background(), includeRepos)
 		if err != nil {
 			return scanDoneMsg{err: err, fp: fp}
 		}
@@ -97,6 +106,13 @@ func refreshCmd(oldFP string, hasData bool) tea.Cmd {
 	}
 }
 
+func loadRepoSources(pkgs []Package) tea.Cmd {
+	return func() tea.Msg {
+		repos, err := loadRepos(context.Background())
+		return repoDoneMsg{pkgs: pkgs, repos: repos, err: err}
+	}
+}
+
 func (m *model) resize(width, height int) {
 	m.width, m.height = width, height
 	m.lay = computeLayout(width, height, m.icons)
@@ -106,7 +122,7 @@ func (m *model) resize(width, height int) {
 func (m *model) rebuildRows() {
 	q := strings.ToLower(strings.TrimSpace(m.query))
 	m.visible = m.visible[:0]
-	m.counts = [4]int{}
+	m.counts = [kindCount]int{}
 	for _, p := range m.all {
 		if !m.filters.IncludeBase && p.FromBase {
 			continue
@@ -114,9 +130,7 @@ func (m *model) rebuildRows() {
 		if !m.filters.ShowDev && p.DevNoise {
 			continue
 		}
-		if !m.filters.ShowTUI && p.TUI {
-			continue
-		}
+
 		if !m.filters.AllUser && p.SystemComponent {
 			continue
 		}
@@ -183,6 +197,35 @@ func (m *model) clampScroll() {
 func (m *model) move(delta int) {
 	m.cursor += delta
 	m.clampScroll()
+}
+
+func (m *model) moveDependencies(delta int) {
+	p, ok := m.selected()
+	if !ok {
+		return
+	}
+	result, ok := m.deps[packageKey(p)]
+	if !ok {
+		return
+	}
+	page := max(1, m.lay.detH-2)
+	maxOffset := max(0, len(result.lines)-page)
+	m.depsOffset = clamp(m.depsOffset+delta, 0, maxOffset)
+}
+
+func (m *model) jumpDependencies(end bool) {
+	if !end {
+		m.depsOffset = 0
+		return
+	}
+	p, ok := m.selected()
+	if !ok {
+		return
+	}
+	result, ok := m.deps[packageKey(p)]
+	if ok {
+		m.depsOffset = max(0, len(result.lines)-max(1, m.lay.detH-2))
+	}
 }
 
 func (m *model) jump(index int) {

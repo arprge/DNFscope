@@ -14,10 +14,10 @@ type Package struct {
 	Reason          string    `json:"reason"`
 	Commands        []string  `json:"commands,omitempty"`
 	HasDesktop      bool      `json:"has_desktop"`
+	Repo            string    `json:"repo,omitempty"`
 	FromBase        bool      `json:"from_base"`
 	DevNoise        bool      `json:"dev_noise"`
 	SystemComponent bool      `json:"system_component"`
-	TUI             bool      `json:"tui"`
 }
 
 func (p Package) KindLabel() string {
@@ -36,7 +36,6 @@ type Filters struct {
 	AllUser     bool // show every user package, including fonts/themes/libs
 	IncludeBase bool // show packages from the base image transactions
 	ShowDev     bool // show -devel/-doc/-static noise
-	ShowTUI     bool // show terminal UI apps (tui-tools family)
 }
 
 type SortMode int
@@ -76,8 +75,10 @@ const (
 	KindPkg
 )
 
+const kindCount = 4
+
 func (k KindFilter) next(delta int) KindFilter {
-	return KindFilter((int(k) + delta + 4) % 4)
+	return KindFilter((int(k) + delta + kindCount) % kindCount)
 }
 
 func (k KindFilter) label() string {
@@ -88,6 +89,7 @@ func (k KindFilter) label() string {
 		return "cli"
 	case KindPkg:
 		return "pkg"
+
 	default:
 		return "all"
 	}

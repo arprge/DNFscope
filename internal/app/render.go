@@ -139,6 +139,12 @@ func (m model) statusText() (string, lipgloss.Style) {
 		return "scan failed", paint(theme.red, bg)
 	case m.loading:
 		return spinnerFrames[m.spin] + " scanning rpmdb…", paint(theme.accent, bg)
+	case m.notice != "":
+		color := theme.green
+		if strings.HasPrefix(m.notice, "copy failed:") || m.notice == "nothing selected" {
+			color = theme.red
+		}
+		return m.notice, paint(color, bg).Bold(true)
 	case m.flash:
 		return fmt.Sprintf("%d user packages · updated", len(m.all)), paint(theme.accent, bg).Bold(true)
 	default:
@@ -235,16 +241,6 @@ func (m model) tabsRow() string {
 	right := paint(theme.overlay1, bg).Render("sort ") +
 		paint(theme.text, bg).Render(m.sortMode.String()+" "+dir) +
 		canvas(bg).Render(" ")
-	for _, f := range []struct {
-		key string
-		on  bool
-	}{{"all", m.filters.AllUser}, {"base", m.filters.IncludeBase}, {"dev", m.filters.ShowDev}, {"tui", m.filters.ShowTUI}} {
-		st := paint(theme.overlay0, bg)
-		if f.on {
-			st = paint(theme.green, bg)
-		}
-		right = st.Render(f.key) + canvas(bg).Render(" ") + right
-	}
 	right = canvas(bg).Render(" ") + right
 
 	gap := l.termW - ansi.StringWidth(left) - ansi.StringWidth(right)
@@ -322,8 +318,8 @@ func (m model) packageRow(idx int) string {
 	if l.showDate {
 		dateW = 9
 	}
-	// gutter 1 + badge + gap 1 + name + gap 2 + cmds + date + pad 1
-	rest := inner - 1 - badgeW - 1 - 2 - dateW - 1
+	// gutter 1 + badge + gap 2 + name + gap 2 + cmds + date + pad 1
+	rest := inner - 1 - badgeW - 2 - 2 - dateW - 1
 	nameW := clamp(rest*45/100, 6, 30)
 	cmdW := rest - nameW
 	if cmdW < 0 {
@@ -338,7 +334,7 @@ func (m model) packageRow(idx int) string {
 	spans := []span{
 		cell(gutter, gutterStyle, 1),
 		cell(badge, paint(kindColor(p.KindLabel()), bg), badgeW),
-		cell(" ", canvas(bg), 1),
+		cell("  ", canvas(bg), 2),
 		cell(p.Name, nameStyle, nameW),
 		cell("  ", canvas(bg), 2),
 		cell(cmds, paint(theme.subtext0, bg), cmdW),
@@ -365,8 +361,9 @@ func kv(label, value string, valueStyle lipgloss.Style, w int) string {
 	bg := theme.base
 	return renderSpans([]span{
 		cell(" ", canvas(bg), 1),
-		cell(label, paint(theme.overlay0, bg), 10),
-		cell(value, valueStyle, max(0, w-11)),
+		cell(label, paint(theme.overlay0, bg), 14),
+		cell(" ", canvas(bg), 1),
+		cell(value, valueStyle, max(0, w-16)),
 	})
 }
 
@@ -376,6 +373,9 @@ func (m model) detailPanel(w, h int) []string {
 	p, ok := m.selected()
 	if !ok {
 		return panel("Details", "", w, h, false, []string{centered(inner, "nothing selected", theme.overlay0, bg)})
+	}
+	if m.showDeps {
+		return m.dependenciesPanel(p, w, h)
 	}
 
 	accent := kindColor(p.KindLabel())
@@ -407,10 +407,56 @@ func (m model) detailPanel(w, h int) []string {
 		kv("installed", fmtDate(p.InstallTime)+" · "+relDate(p.InstallTime, time.Now()), text, inner),
 		kv("reason", p.Reason+" · "+p.Arch, text, inner),
 	)
+	if m.repoSource {
+		repository := p.Repo
+		if m.repoLoading {
+			repository = "loading…"
+		} else if repository == "" {
+			repository = "unknown"
+		}
+		lines = append(lines, kv("installed from", repository, text, inner))
+	}
 	if p.URL != "" {
 		lines = append(lines, kv("url", p.URL, paint(theme.sapphire, bg), inner))
 	}
 	return panel("Details", "", w, h, false, lines)
+}
+
+func (m model) dependenciesPanel(p Package, w, h int) []string {
+	bg := theme.base
+	inner := w - 2
+	key := packageKey(p)
+	if m.depsLoading == key {
+		return panel("Requirements", "loading…", w, h, false, []string{
+			centered(inner, "reading installed package requirements…", theme.overlay0, bg),
+		})
+	}
+	result, ok := m.deps[key]
+	if !ok {
+		return panel("Requirements", "", w, h, false, []string{
+			centered(inner, "select this package and press r", theme.overlay0, bg),
+		})
+	}
+	if result.err != nil {
+		return panel("Requirements", "error", w, h, false, []string{
+			" " + paint(theme.red, bg).Render(result.err.Error()),
+		})
+	}
+	if len(result.lines) == 0 {
+		return panel("Requirements", "0", w, h, false, []string{
+			centered(inner, "no non-RPM-library requirements", theme.overlay0, bg),
+		})
+	}
+
+	page := max(1, h-2)
+	offset := clamp(m.depsOffset, 0, max(0, len(result.lines)-page))
+	end := min(len(result.lines), offset+page)
+	lines := make([]string, 0, end-offset)
+	for _, requirement := range result.lines[offset:end] {
+		lines = append(lines, "  "+paint(theme.text, bg).Render(requirement))
+	}
+	right := fmt.Sprintf("%d–%d / %d", offset+1, end, len(result.lines))
+	return panel("Requirements", right, w, h, false, lines)
 }
 
 // --- overview ------------------------------------------------------------
@@ -494,38 +540,53 @@ func (m model) footerRow() string {
 		hints = []hint{
 			{"/", "search", false},
 			{"tab", "type", false},
+			{"c", "copy name", false},
+			{"r", "requires", m.showDeps},
 			{"?", "help", false},
 			{"s", "sort", false},
 			{"a", "all", m.filters.AllUser},
 			{"b", "base", m.filters.IncludeBase},
 			{"d", "dev", m.filters.ShowDev},
-			{"t", "tui", m.filters.ShowTUI},
+			{"o", "origin", m.repoSource},
+
 			{"i", "icons", m.icons},
 			{"q", "quit", false},
 		}
 	}
 
 	avail := l.termW - 2
-	var b strings.Builder
+	segs := make([]string, 0, len(hints))
 	used := 0
 	for _, h := range hints {
 		keyStyle := paint(theme.text, bg).Bold(true)
 		if h.on {
 			keyStyle = paint(theme.green, bg).Bold(true)
 		}
-		seg := keyStyle.Render(h.key) + paint(theme.overlay1, bg).Render(" "+h.desc)
+		seg := canvas(bg).Render(" ") + keyStyle.Render(h.key) + paint(theme.overlay1, bg).Render(" "+h.desc+" ")
 		w := ansi.StringWidth(seg)
-		if used > 0 {
-			w += 2
-		}
-		if used+w > avail {
+		if used+w+max(0, len(segs)*2) > avail {
 			break
 		}
-		if used > 0 {
-			b.WriteString(canvas(bg).Render("  "))
+		segs = append(segs, seg)
+		used += w
+	}
+
+	var b strings.Builder
+	gap := 0
+	extra := 0
+	if len(segs) > 1 {
+		gap = (avail - used) / (len(segs) - 1)
+		extra = (avail - used) % (len(segs) - 1)
+	}
+	for i, seg := range segs {
+		if i > 0 {
+			spaces := gap
+			if i <= extra {
+				spaces++
+			}
+			b.WriteString(canvas(bg).Render(strings.Repeat(" ", spaces)))
 		}
 		b.WriteString(seg)
-		used += w
 	}
 	return fitLine(" "+b.String(), l.termW, bg)
 }
@@ -548,10 +609,13 @@ func (m model) helpPanel(h int) []string {
 		row("1 2 3 4", "all / app / cli / pkg"),
 		row("/", "search · esc clears"),
 		row("s  S", "cycle sort · reverse"),
+		row("c", "copy selected package name"),
+		row("r", "requirements · arrows scroll"),
 		row("a", "include non-tool packages"),
 		row("b", "include base image"),
 		row("d", "include -devel / -doc"),
-		row("t", "include terminal UI apps"),
+		row("o", "load repository origins (slower)"),
+
 		row("i", "toggle icons"),
 		row("q", "quit"),
 	}

@@ -175,8 +175,9 @@ type histInfo struct {
 	RPMDBBegin  string `json:"rpmdb_version_begin"`
 	Status      string `json:"status"`
 	Packages    []struct {
-		NEVRA  string `json:"nevra"`
-		Action string `json:"action"`
+		NEVRA      string `json:"nevra"`
+		Action     string `json:"action"`
+		Repository string `json:"repository"`
 	} `json:"packages"`
 }
 
@@ -299,6 +300,92 @@ func addBaseNames(base map[string]struct{}, info histInfo) {
 	}
 }
 
+// loadRepos maps name.arch|EVR to the repository that most recently installed
+// that build. Removals and replacements carry no source and are skipped.
+func loadRepos(ctx context.Context) (map[string]string, error) {
+	return loadReposWith(ctx, runCmd)
+}
+
+// loadReposWith asks dnf5 only for transactions newer than the cached LastID.
+// History is append-only, so a steady-state scan costs one "history list" call.
+func loadReposWith(ctx context.Context, run commandRunner) (map[string]string, error) {
+	out, err := run(ctx, "dnf5", "history", "list", "--json")
+	if err != nil {
+		return nil, err
+	}
+	var list []struct {
+		ID int `json:"id"`
+	}
+	if err := json.Unmarshal(out, &list); err != nil {
+		return nil, err
+	}
+	maxID := 0
+	for _, t := range list {
+		maxID = max(maxID, t.ID)
+	}
+
+	rh := readRepoHistory()
+	if rh == nil || rh.LastID > maxID {
+		// History was rotated or reset, so the cached IDs no longer apply.
+		rh = &repoHistory{Schema: repoHistorySchema, Repos: map[string]string{}}
+	}
+	args := []string{"history", "info"}
+	for _, t := range list {
+		if t.ID > rh.LastID {
+			args = append(args, strconv.Itoa(t.ID))
+		}
+	}
+	if len(args) == 2 {
+		return rh.Repos, nil
+	}
+
+	out, err = run(ctx, "dnf5", append(args, "--json")...)
+	if err != nil {
+		return nil, err
+	}
+	var infos []histInfo
+	if err := json.Unmarshal(out, &infos); err != nil {
+		return nil, err
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].ID > infos[j].ID })
+
+	// Newest transaction first, so the first install of a build is its source.
+	fresh := make(map[string]string)
+	for _, info := range infos {
+		for _, p := range info.Packages {
+			switch p.Action {
+			case "Install", "Upgrade", "Downgrade", "Reinstall":
+			default:
+				continue
+			}
+			if p.Repository == "" || strings.HasPrefix(p.Repository, "@") {
+				continue
+			}
+			key := repoKey(p.NEVRA)
+			if _, seen := fresh[key]; key != "" && !seen {
+				fresh[key] = p.Repository
+			}
+		}
+	}
+	for k, v := range fresh {
+		rh.Repos[k] = v
+	}
+	rh.LastID = maxID
+	_ = writeRepoHistory(rh) // a failed write only costs a refetch next scan
+	return rh.Repos, nil
+}
+
+// repoKey turns a history NEVRA into the same name.arch|EVR form that rpm
+// reports, so an installed package can be matched to the transaction that
+// installed exactly that build.
+func repoKey(nevra string) string {
+	m := nevraRe.FindStringSubmatch(nevra)
+	if m == nil {
+		return ""
+	}
+	return m[1] + "." + m[4] + "|" + m[2] + "-" + m[3]
+}
+
 func nevraKey(nevra string) string {
 	if m := nevraRe.FindStringSubmatch(nevra); m != nil {
 		return m[1] + "." + m[4]
@@ -307,7 +394,7 @@ func nevraKey(nevra string) string {
 }
 
 // buildPackages scans the rpmdb once and keeps only packages the user asked for.
-func buildPackages(ctx context.Context) ([]Package, bool, error) {
+func buildPackages(ctx context.Context, includeRepos bool) ([]Package, bool, error) {
 	reasons, err := loadReasons()
 	if err != nil {
 		return nil, false, fmt.Errorf("read packages.toml: %w", err)
@@ -319,11 +406,35 @@ func buildPackages(ctx context.Context) ([]Package, bool, error) {
 		baseFound = false
 	}
 
+	var repos map[string]string
+	if includeRepos {
+		// The repo lookup is independent of the rpm scan, so overlap them. A
+		// failed lookup only hides the repo row.
+		reposCh := make(chan map[string]string, 1)
+		go func() {
+			repos, err := loadRepos(ctx)
+			if err != nil {
+				repos = nil
+			}
+			reposCh <- repos
+		}()
+
+		pkgs, err := scanRPM(ctx, reasons, base)
+		repos = <-reposCh
+		if err != nil {
+			return nil, baseFound, err
+		}
+		return finishPackages(pkgs, repos), baseFound, nil
+	}
+
 	pkgs, err := scanRPM(ctx, reasons, base)
 	if err != nil {
 		return nil, baseFound, err
 	}
+	return finishPackages(pkgs, nil), baseFound, nil
+}
 
+func finishPackages(pkgs []Package, repos map[string]string) []Package {
 	for i := range pkgs {
 		p := &pkgs[i]
 		if len(p.Commands) > 1 {
@@ -336,13 +447,14 @@ func buildPackages(ctx context.Context) ([]Package, bool, error) {
 			}
 			p.Commands = uniq
 		}
+		p.Repo = repos[p.Name+"."+p.Arch+"|"+p.EVR]
 		p.DevNoise = devNameRe.MatchString(p.Name) || devSummaryRe.MatchString(p.Summary)
 		p.SystemComponent = isSystemComponent(p.Name)
-		p.TUI = isTUI(p.Name, p.Commands)
+
 	}
 
 	sort.SliceStable(pkgs, func(i, j int) bool { return pkgs[i].InstallTime.After(pkgs[j].InstallTime) })
-	return pkgs, baseFound, nil
+	return pkgs
 }
 
 // systemComponents are user-marked packages that ship desktop files but are
