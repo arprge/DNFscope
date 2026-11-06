@@ -19,6 +19,9 @@ func (m model) View() string {
 	if l.tabsRow {
 		parts = append(parts, m.tabsRow())
 	}
+	if l.contentGap {
+		parts = append(parts, blankLine(l.termW))
+	}
 
 	list := m.listPanel()
 	switch l.mode {

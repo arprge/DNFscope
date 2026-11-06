@@ -28,10 +28,11 @@ type layout struct {
 	termW, termH int
 	icons        bool
 
-	mode      layoutMode
-	tabsRow   bool
-	searchRow bool
-	avail     int
+	mode       layoutMode
+	tabsRow    bool
+	searchRow  bool
+	contentGap bool
+	avail      int
 
 	listW, listH, listInnerW, bodyH int
 	detW, detH                      int
@@ -57,7 +58,8 @@ func computeLayout(w, h int, icons bool) layout {
 	l := layout{termW: w, termH: h, icons: icons}
 	l.tabsRow = h >= 9
 	l.searchRow = h >= 14
-	l.avail = h - 2 - boolInt(l.tabsRow) - boolInt(l.searchRow)
+	l.contentGap = h >= 5
+	l.avail = h - 2 - boolInt(l.tabsRow) - boolInt(l.searchRow) - boolInt(l.contentGap)
 
 	switch {
 	case w >= splitMinW && l.avail >= 10:

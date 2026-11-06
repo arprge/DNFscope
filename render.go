@@ -70,17 +70,13 @@ func centered(w int, msg string, fg, bg lipgloss.Color) string {
 // fitted to the inner width; missing lines are blank.
 func panel(title, right string, w, h int, active bool, body []string) []string {
 	bg := theme.base
-	page := theme.mantle
-	inner := w - 2
-
-	// Lit from the top left: top and left edges are light, bottom and right
-	// edges fall into shade.
-	lit, shade, tc := theme.surface2, theme.crust, theme.subtext0
+	border := paint(theme.surface1, theme.mantle)
+	titleStyle := paint(theme.subtext0, theme.mantle).Bold(true)
 	if active {
-		lit, shade, tc = theme.accent, theme.surface1, theme.accent
+		border = paint(theme.accent, theme.mantle)
+		titleStyle = paint(theme.accent, theme.mantle).Bold(true)
 	}
-	litS := paint(lit, page)
-	shadeS := paint(shade, page)
+	inner := w - 2
 
 	t := ansi.Truncate(title, max(0, inner-4), "…")
 	tw := ansi.StringWidth(t)
@@ -95,12 +91,12 @@ func panel(title, right string, w, h int, active bool, body []string) []string {
 	}
 	fill := max(0, inner-used)
 
-	top := litS.Render("╭─ ") + paint(tc, page).Bold(true).Render(t)
+	top := border.Render("┌─ ") + titleStyle.Render(t)
 	if r == "" {
-		top += litS.Render(" "+strings.Repeat("─", fill)) + shadeS.Render("╮")
+		top += border.Render(" " + strings.Repeat("─", fill) + "┐")
 	} else {
-		top += litS.Render(" "+strings.Repeat("─", fill)+" ") +
-			paint(theme.overlay1, page).Render(r) + litS.Render(" ─") + shadeS.Render("╮")
+		top += border.Render(" "+strings.Repeat("─", fill)+" ") +
+			paint(theme.overlay1, theme.mantle).Render(r) + border.Render(" ─┐")
 	}
 
 	out := make([]string, 0, h)
@@ -110,9 +106,9 @@ func panel(title, right string, w, h int, active bool, body []string) []string {
 		if i < len(body) {
 			line = body[i]
 		}
-		out = append(out, litS.Render("│")+fitLine(line, inner, bg)+shadeS.Render("│"))
+		out = append(out, border.Render("│")+fitLine(line, inner, bg)+border.Render("│"))
 	}
-	out = append(out, litS.Render("╰")+shadeS.Render(strings.Repeat("─", inner)+"╯"))
+	out = append(out, border.Render("└"+strings.Repeat("─", inner)+"┘"))
 	return out
 }
 
@@ -167,22 +163,22 @@ func (m model) headerRow() string {
 
 func (m model) searchRow() string {
 	l := m.lay
-	bg := theme.crust
-	w := l.termW - 2
+	bg := theme.surface0
+	innerW := l.termW - 4
 
-	var line string
+	var left string
 	switch {
 	case m.searching:
-		caret := paint(theme.surface2, bg).Render("▌")
+		left = paint(theme.accent, bg).Bold(true).Render("/  ") + paint(theme.text, bg).Render(m.query)
+		caret := theme.overlay0
 		if m.caretOn {
-			caret = paint(theme.accent, bg).Render("▌")
+			caret = theme.accent
 		}
-		line = paint(theme.accent, bg).Bold(true).Render(" / ") +
-			paint(theme.text, bg).Render(m.query) + caret
+		left += paint(caret, bg).Render("▏")
 	case m.query != "":
-		line = paint(theme.accent, bg).Render(" / ") + paint(theme.text, bg).Render(m.query)
+		left = paint(theme.accent, bg).Bold(true).Render("/  ") + paint(theme.text, bg).Render(m.query)
 	default:
-		line = paint(theme.overlay0, bg).Render(" / type to search names, commands, summaries")
+		left = paint(theme.overlay1, bg).Render("/  Search packages, commands, summaries")
 	}
 
 	right := ""
@@ -191,13 +187,22 @@ func (m model) searchRow() string {
 		if len(m.visible) == 1 {
 			word = "match"
 		}
-		right = fmt.Sprintf("%d %s ", len(m.visible), word)
+		right = fmt.Sprintf("%d %s", len(m.visible), word)
 	}
-	rw := ansi.StringWidth(right)
-	left := fitLine(line, max(0, w-rw), bg)
-	mid := left + paint(theme.overlay1, bg).Render(right)
-	cap := paint(theme.crust, theme.mantle)
-	return cap.Render("▐") + fitLine(mid, w, bg) + cap.Render("▌")
+	leftW, rightW := ansi.StringWidth(left), ansi.StringWidth(right)
+	contentW := max(0, innerW)
+	if rightW > 0 {
+		left = ansi.Truncate(left, max(0, contentW-rightW-2), "…")
+		leftW = ansi.StringWidth(left)
+	}
+	content := paint(theme.surface1, bg).Render(" ") + left
+	if rightW > 0 {
+		gap := max(1, contentW-1-leftW-rightW)
+		content += canvas(bg).Render(strings.Repeat(" ", gap)) + paint(theme.subtext0, bg).Render(right)
+	}
+	content += paint(theme.surface1, bg).Render(strings.Repeat(" ", max(0, contentW-ansi.StringWidth(content))))
+	return canvas(theme.mantle).Render(" ") + paint(theme.surface1, bg).Render("│") +
+		content + paint(theme.surface1, bg).Render("│") + canvas(theme.mantle).Render(" ")
 }
 
 func (m model) tabsRow() string {
