@@ -1,0 +1,43 @@
+package main
+
+import "strings"
+
+func (m model) View() string {
+	l := m.lay
+	parts := make([]string, 0, l.termH)
+	parts = append(parts, m.headerRow())
+
+	if m.help {
+		parts = append(parts, m.helpPanel(l.termH-2)...)
+		parts = append(parts, m.footerRow())
+		return strings.Join(parts, "\n")
+	}
+
+	if l.searchRow {
+		parts = append(parts, m.searchRow())
+	}
+	if l.tabsRow {
+		parts = append(parts, m.tabsRow())
+	}
+
+	list := m.listPanel()
+	switch l.mode {
+	case modeSplit:
+		right := m.detailPanel(l.detW, l.detH)
+		if l.ovH > 0 {
+			right = append(right, m.overviewPanel(l.detW, l.ovH)...)
+		}
+		parts = append(parts, joinCols(list, right)...)
+	case modeStack:
+		parts = append(parts, list...)
+		parts = append(parts, m.detailPanel(l.detW, l.detH)...)
+	default:
+		parts = append(parts, list...)
+		if l.strip {
+			parts = append(parts, m.stripRow())
+		}
+	}
+
+	parts = append(parts, m.footerRow())
+	return strings.Join(parts, "\n")
+}
