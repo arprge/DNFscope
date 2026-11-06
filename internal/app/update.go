@@ -1,6 +1,9 @@
 package app
 
 import (
+	"errors"
+	"os/exec"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -14,9 +17,20 @@ type scanDoneMsg struct {
 	err       error
 }
 
+type repoDoneMsg struct {
+	pkgs  []Package
+	repos map[string]string
+	err   error
+}
+
 type spinnerMsg struct{}
 type blinkMsg struct{}
 type flashMsg struct{}
+type copyDoneMsg struct {
+	name string
+	err  error
+}
+type clearNoticeMsg string
 
 func spinnerTick() tea.Cmd {
 	return tea.Tick(80*time.Millisecond, func(time.Time) tea.Msg { return spinnerMsg{} })
@@ -55,6 +69,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.flash = false
 		return m, nil
 
+	case copyDoneMsg:
+		if msg.err != nil {
+			m.notice = "copy failed: " + msg.err.Error()
+		} else {
+			m.notice = "copied " + msg.name
+		}
+		notice := m.notice
+		return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return clearNoticeMsg(notice) })
+
+	case clearNoticeMsg:
+		if m.notice == string(msg) {
+			m.notice = ""
+		}
+		return m, nil
+
+	case depsDoneMsg:
+		m.depsLoading = ""
+		m.deps[msg.key] = msg.result
+		return m, nil
+
 	case scanDoneMsg:
 		m.loading = false
 		if msg.err != nil {
@@ -71,6 +105,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.rebuildRows()
 		m.flash = true
 		return m, flashTick()
+
+	case repoDoneMsg:
+		m.repoLoading = false
+		if !m.repoSource {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.notice = "repo lookup failed"
+			return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return clearNoticeMsg(m.notice) })
+		}
+		for i := range msg.pkgs {
+			p := &msg.pkgs[i]
+			p.Repo = msg.repos[p.Name+"."+p.Arch+"|"+p.EVR]
+		}
+		m.all = msg.pkgs
+		_ = writeCache(&cacheFile{Schema: cacheSchema, Fingerprint: m.fp, BaseFound: m.baseFound, Packages: m.all})
+		return m, nil
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -98,22 +149,81 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		return m, tea.Quit
 
+	case "c":
+		p, ok := m.selected()
+		if !ok {
+			m.notice = "nothing selected"
+			return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return clearNoticeMsg(m.notice) })
+		}
+		return m, copyPackageName(p.Name)
+
+	case "r":
+		p, ok := m.selected()
+		if !ok {
+			return m, nil
+		}
+		key := packageKey(p)
+		if m.showDeps && m.depsLoading != key {
+			m.showDeps = false
+			m.depsOffset = 0
+			return m, nil
+		}
+		m.showDeps = true
+		m.depsOffset = 0
+		if _, cached := m.deps[key]; cached || m.depsLoading == key {
+			return m, nil
+		}
+		m.depsLoading = key
+		return m, loadDependencies(key)
+
 	case "up", "k":
-		m.move(-1)
+		if m.showDeps {
+			m.moveDependencies(-1)
+		} else {
+			m.move(-1)
+		}
 	case "down", "j":
-		m.move(1)
+		if m.showDeps {
+			m.moveDependencies(1)
+		} else {
+			m.move(1)
+		}
 	case "ctrl+u":
-		m.move(-max(1, m.lay.bodyH/2))
+		if m.showDeps {
+			m.moveDependencies(-max(1, m.lay.detH-2))
+		} else {
+			m.move(-max(1, m.lay.bodyH/2))
+		}
 	case "ctrl+d":
-		m.move(max(1, m.lay.bodyH/2))
+		if m.showDeps {
+			m.moveDependencies(max(1, m.lay.detH-2))
+		} else {
+			m.move(max(1, m.lay.bodyH/2))
+		}
 	case "pgup", "ctrl+b":
-		m.move(-max(1, m.lay.bodyH))
+		if m.showDeps {
+			m.moveDependencies(-max(1, m.lay.detH-2))
+		} else {
+			m.move(-max(1, m.lay.bodyH))
+		}
 	case "pgdown", "ctrl+f":
-		m.move(max(1, m.lay.bodyH))
-	case "home", "g":
-		m.jump(0)
-	case "end", "G":
-		m.jump(len(m.visible) - 1)
+		if m.showDeps {
+			m.moveDependencies(max(1, m.lay.detH-2))
+		} else {
+			m.move(max(1, m.lay.bodyH))
+		}
+	case "g":
+		if m.showDeps {
+			m.jumpDependencies(false)
+		} else {
+			m.jump(0)
+		}
+	case "G":
+		if m.showDeps {
+			m.jumpDependencies(true)
+		} else {
+			m.jump(len(m.visible) - 1)
+		}
 
 	case "tab", "right", "l":
 		m.kind = m.kind.next(1)
@@ -154,9 +264,13 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "d":
 		m.filters.ShowDev = !m.filters.ShowDev
 		m.rebuildRows()
-	case "t":
-		m.filters.ShowTUI = !m.filters.ShowTUI
-		m.rebuildRows()
+
+	case "o":
+		m.repoSource = !m.repoSource
+		if m.repoSource && len(m.all) > 0 {
+			m.repoLoading = true
+			return m, loadRepoSources(m.all)
+		}
 
 	case "i":
 		m.icons = !m.icons
@@ -166,6 +280,26 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.help = true
 	}
 	return m, nil
+}
+
+func copyPackageName(name string) tea.Cmd {
+	return func() tea.Msg {
+		for _, candidate := range []struct {
+			binary string
+			args   []string
+		}{{"wl-copy", nil}, {"xclip", []string{"-selection", "clipboard"}}, {"xsel", []string{"--clipboard", "--input"}}, {"pbcopy", nil}} {
+			path, err := exec.LookPath(candidate.binary)
+			if err != nil {
+				continue
+			}
+			cmd := exec.Command(path, candidate.args...)
+			cmd.Stdin = strings.NewReader(name)
+			if err := cmd.Run(); err == nil {
+				return copyDoneMsg{name: name}
+			}
+		}
+		return copyDoneMsg{name: name, err: errors.New("no working clipboard utility found (wl-copy, xclip, xsel, pbcopy)")}
+	}
 }
 
 func (m model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {

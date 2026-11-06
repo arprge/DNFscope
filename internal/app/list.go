@@ -22,7 +22,7 @@ func RunList(w io.Writer) error {
 		fromCache = true
 	} else {
 		var err error
-		pkgs, baseFound, err = buildPackages(context.Background())
+		pkgs, baseFound, err = buildPackages(context.Background(), false)
 		if err != nil {
 			return err
 		}
@@ -38,7 +38,7 @@ func RunList(w io.Writer) error {
 
 	shown := 0
 	for _, p := range pkgs {
-		if p.FromBase || p.DevNoise || p.SystemComponent || p.TUI || (!p.HasDesktop && len(p.Commands) == 0) {
+		if p.FromBase || p.DevNoise || p.SystemComponent || (!p.HasDesktop && len(p.Commands) == 0) {
 			continue
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",

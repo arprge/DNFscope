@@ -2,6 +2,9 @@ package app
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -82,6 +85,11 @@ func TestViewFitsTerminalStates(t *testing.T) {
 		"loading": func(m *model) { m.loading = true },
 		"flash":   func(m *model) { m.flash = true },
 		"error":   func(m *model) { m.err = errors.New("boom") },
+		"requirements": func(m *model) {
+			m.showDeps = true
+			p, _ := m.selected()
+			m.deps[packageKey(p)] = dependencyResult{lines: []string{"glibc >= 2.38", "libxkbcommon.so.0()(64bit)"}}
+		},
 	}
 	for name, mutate := range states {
 		for _, sz := range sizes {
@@ -96,6 +104,30 @@ func TestViewFitsTerminalStates(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestDetailPanelShowsInstallRepository(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		repo string
+	}{
+		{name: "known", repo: "fedora"},
+		{name: "unknown"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := baseModel(false)
+			m.loading = false
+			m.repoSource = true
+			m.all = []Package{{Name: "example", Arch: "x86_64", EVR: "1.0", Repo: test.repo, Commands: []string{"example"}}}
+			m.rebuildRows()
+
+			lines := strings.Join(m.detailPanel(80, 20), "\n")
+			plain := ansi.Strip(lines)
+			if !strings.Contains(plain, "installed") || !strings.Contains(plain, test.repo) {
+				t.Fatalf("detail panel does not show install source %q:\n%s", test.repo, plain)
+			}
+		})
 	}
 }
 
@@ -134,6 +166,57 @@ func TestRelDate(t *testing.T) {
 		if got != c.want {
 			t.Errorf("%d days: got %q want %q", c.days, got, c.want)
 		}
+	}
+}
+
+func TestParseDependencies(t *testing.T) {
+	got := parseDependencies("glibc >= 2.38\nrpmlib(CompressedFileNames) <= 3.0.4-1\naardvark.so.1()(64bit)\nglibc >= 2.38\n")
+	want := []string{"glibc >= 2.38", "aardvark.so.1()(64bit)"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("parseDependencies() = %q, want %q", got, want)
+	}
+}
+
+func TestDependencyScroll(t *testing.T) {
+	m := baseModel(false)
+	m.loading = false
+	m.all = []Package{{Name: "example", Arch: "x86_64", Commands: []string{"example"}}}
+	m.rebuildRows()
+	m.showDeps = true
+	m.lay.detH = 4
+	m.deps["example.x86_64"] = dependencyResult{lines: []string{"one", "two", "three", "four"}}
+
+	m.moveDependencies(1)
+	if m.depsOffset != 1 {
+		t.Fatalf("dependencies offset=%d, want 1", m.depsOffset)
+	}
+	m.jumpDependencies(true)
+	if m.depsOffset != 2 {
+		t.Fatalf("end offset=%d, want 2", m.depsOffset)
+	}
+}
+
+func TestCopyPackageName(t *testing.T) {
+	dir := t.TempDir()
+	clipboard := filepath.Join(dir, "clipboard")
+	tool := filepath.Join(dir, "wl-copy")
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\n/bin/cat > \"$COPY_OUTPUT\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("COPY_OUTPUT", clipboard)
+
+	msg := copyPackageName("example-package")()
+	result, ok := msg.(copyDoneMsg)
+	if !ok || result.err != nil {
+		t.Fatalf("copyPackageName() = %#v", msg)
+	}
+	got, err := os.ReadFile(clipboard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "example-package" {
+		t.Fatalf("clipboard got %q", got)
 	}
 }
 
