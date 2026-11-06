@@ -77,7 +77,7 @@ func panel(title, right string, w, h int, active bool, body []string) []string {
 	// edges fall into shade.
 	lit, shade, tc := theme.surface2, theme.crust, theme.subtext0
 	if active {
-		lit, shade, tc = theme.lavender, theme.surface1, theme.lavender
+		lit, shade, tc = theme.accent, theme.surface1, theme.accent
 	}
 	litS := paint(lit, page)
 	shadeS := paint(shade, page)
@@ -142,9 +142,9 @@ func (m model) statusText() (string, lipgloss.Style) {
 	case m.err != nil:
 		return "scan failed", paint(theme.red, bg)
 	case m.loading:
-		return spinnerFrames[m.spin] + " scanning rpmdb…", paint(theme.lavender, bg)
+		return spinnerFrames[m.spin] + " scanning rpmdb…", paint(theme.accent, bg)
 	case m.flash:
-		return fmt.Sprintf("%d user packages · updated", len(m.all)), paint(theme.lavender, bg).Bold(true)
+		return fmt.Sprintf("%d user packages · updated", len(m.all)), paint(theme.accent, bg).Bold(true)
 	default:
 		return fmt.Sprintf("%d user packages", len(m.all)), paint(theme.overlay1, bg)
 	}
@@ -153,7 +153,7 @@ func (m model) statusText() (string, lipgloss.Style) {
 func (m model) headerRow() string {
 	l := m.lay
 	bg := theme.mantle
-	title := paint(theme.mauve, bg).Bold(true).Render("DNFscope")
+	title := paint(theme.accent, bg).Bold(true).Render("DNFscope")
 	tw := ansi.StringWidth(title)
 	info, style := m.statusText()
 
@@ -175,12 +175,12 @@ func (m model) searchRow() string {
 	case m.searching:
 		caret := paint(theme.surface2, bg).Render("▌")
 		if m.caretOn {
-			caret = paint(theme.lavender, bg).Render("▌")
+			caret = paint(theme.accent, bg).Render("▌")
 		}
-		line = paint(theme.lavender, bg).Bold(true).Render(" / ") +
+		line = paint(theme.accent, bg).Bold(true).Render(" / ") +
 			paint(theme.text, bg).Render(m.query) + caret
 	case m.query != "":
-		line = paint(theme.lavender, bg).Render(" / ") + paint(theme.text, bg).Render(m.query)
+		line = paint(theme.accent, bg).Render(" / ") + paint(theme.text, bg).Render(m.query)
 	default:
 		line = paint(theme.overlay0, bg).Render(" / type to search names, commands, summaries")
 	}
@@ -214,9 +214,9 @@ func (m model) tabsRow() string {
 		}
 		label = fmt.Sprintf(" %s %d ", label, m.counts[k])
 		if k == m.kind {
-			segs = append(segs, paint(theme.lavender, bg).Render("▐")+
-				paint(theme.crust, theme.lavender).Bold(true).Render(label)+
-				paint(theme.lavender, bg).Render("▌"))
+			segs = append(segs, paint(theme.accent, bg).Render("▐")+
+				paint(theme.crust, theme.accent).Bold(true).Render(label)+
+				paint(theme.accent, bg).Render("▌"))
 		} else {
 			segs = append(segs, paint(theme.subtext0, bg).Render(" "+label+" "))
 		}
@@ -298,7 +298,7 @@ func (m model) packageRow(idx int) string {
 	}
 	gutter, gutterStyle := " ", canvas(bg)
 	if sel {
-		gutter, gutterStyle = "▌", paint(theme.lavender, bg)
+		gutter, gutterStyle = "▌", paint(theme.accent, bg)
 	}
 	nameStyle := paint(theme.text, bg)
 	if p.FromBase {
@@ -551,9 +551,9 @@ func (m model) helpPanel(h int) []string {
 	if l.icons {
 		lines = append(lines, "",
 			" "+paint(theme.overlay0, bg).Render("types       ")+
-				paint(theme.mauve, bg).Render(iconApp)+desc(" app   ")+
-				paint(theme.teal, bg).Render(iconCLI)+desc(" cli   ")+
-				paint(theme.overlay1, bg).Render(iconPkg)+desc(" pkg"))
+				paint(theme.app, bg).Render(iconApp)+desc(" app   ")+
+				paint(theme.cli, bg).Render(iconCLI)+desc(" cli   ")+
+				paint(theme.pkg, bg).Render(iconPkg)+desc(" pkg"))
 	}
 	return panel("Keys", "", l.termW, h, true, lines)
 }

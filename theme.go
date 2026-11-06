@@ -11,7 +11,7 @@ import (
 // layout its depth without gradients. accent marks focus; app, cli and pkg
 // colour the type badges so each scheme keeps its own type colours.
 type palette struct {
-	name                                lipgloss.Color
+	name                                string
 	crust, mantle, base                 lipgloss.Color
 	surface0, surface1, surface2        lipgloss.Color
 	overlay0, overlay1                  lipgloss.Color
@@ -115,7 +115,7 @@ func themeIndex(name string) int {
 func themeNames() string {
 	names := make([]string, len(flavors))
 	for i, f := range flavors {
-		names[i] = string(f.name)
+		names[i] = f.name
 	}
 	return strings.Join(names, ", ")
 }
