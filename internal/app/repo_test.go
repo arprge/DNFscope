@@ -2,88 +2,99 @@ package app
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
 )
 
-type fakeDNF struct {
-	history map[int]string // transaction ID -> packages JSON
-	infoIDs [][]string     // IDs requested by each "history info" call
+type repoQueryCall struct {
+	name string
+	args []string
 }
 
-func (f *fakeDNF) run(_ context.Context, name string, args ...string) ([]byte, error) {
-	if name != "dnf5" || len(args) == 0 || args[0] != "history" {
-		return nil, fmt.Errorf("unexpected call: %s %v", name, args)
-	}
-	if args[1] == "list" {
-		var parts []string
-		for id := range f.history {
-			parts = append(parts, fmt.Sprintf(`{"id":%d}`, id))
-		}
-		return []byte("[" + strings.Join(parts, ",") + "]"), nil
-	}
-	var ids []string
-	var parts []string
-	for _, a := range args[2:] {
-		if a == "--json" {
-			continue
-		}
-		var id int
-		fmt.Sscan(a, &id)
-		ids = append(ids, a)
-		parts = append(parts, fmt.Sprintf(`{"id":%d,"packages":%s}`, id, f.history[id]))
-	}
-	slices.Sort(ids)
-	f.infoIDs = append(f.infoIDs, ids)
-	return []byte("[" + strings.Join(parts, ",") + "]"), nil
+type fakeRepoQuery struct {
+	out   string
+	err   error
+	calls []repoQueryCall
 }
 
-func TestLoadReposIncremental(t *testing.T) {
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
-	f := &fakeDNF{history: map[int]string{
-		1: `[{"nevra":"fd-find-0:9.0.0-1.fc45.x86_64","action":"Install","repository":"fedora"}]`,
-		2: `[{"nevra":"fd-find-0:9.0.0-1.fc45.x86_64","action":"Replaced","repository":"@System"},
-			{"nevra":"fd-find-0:9.1.0-1.fc45.x86_64","action":"Upgrade","repository":"updates"},
-			{"nevra":"gum-0:0.1.0-1.fc45.x86_64","action":"Install","repository":"@commandline"}]`,
-	}}
+func (f *fakeRepoQuery) run(_ context.Context, name string, args ...string) ([]byte, error) {
+	f.calls = append(f.calls, repoQueryCall{name: name, args: append([]string(nil), args...)})
+	if f.err != nil {
+		return nil, f.err
+	}
+	return []byte(f.out), nil
+}
 
-	repos, err := loadReposWith(context.Background(), f.run)
+func TestLoadInstalledRepos(t *testing.T) {
+	f := &fakeRepoQuery{out: "" +
+		"fd-find.x86_64|9.1.0-1.fc45|updates\n" +
+		"gum.x86_64|0.1.0-1.fc45|@commandline\n" +
+		"systemd.x86_64|257-1.fc45|@System\n" +
+		"local.x86_64|1-1|\n" +
+		"code.x86_64|1.145.2-1793945328.el8|code\n"}
+
+	repos, err := loadInstalledReposWith(context.Background(), f.run)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := repos["fd-find.x86_64|9.1.0-1.fc45"]; got != "updates" {
-		t.Fatalf("fd-find 9.1.0 repo = %q, want %q", got, "updates")
+	want := map[string]string{
+		"fd-find.x86_64|9.1.0-1.fc45":        "updates",
+		"code.x86_64|1.145.2-1793945328.el8": "code",
 	}
-	if got := repos["fd-find.x86_64|9.0.0-1.fc45"]; got != "fedora" {
-		t.Fatalf("fd-find 9.0.0 repo = %q, want %q", got, "fedora")
+	for key, repo := range want {
+		if got := repos[key]; got != repo {
+			t.Fatalf("%s repo = %q, want %q", key, got, repo)
+		}
 	}
-	if _, ok := repos["gum.x86_64|0.1.0-1.fc45"]; ok {
-		t.Fatal("pseudo repository @commandline should not be recorded")
+	for _, key := range []string{"gum.x86_64|0.1.0-1.fc45", "systemd.x86_64|257-1.fc45", "local.x86_64|1-1"} {
+		if _, ok := repos[key]; ok {
+			t.Fatalf("pseudo or empty origin %q should not be recorded", key)
+		}
 	}
-	if !slices.Equal(f.infoIDs[0], []string{"1", "2"}) {
-		t.Fatalf("first scan queried %v, want all transactions", f.infoIDs[0])
-	}
-
-	// A new transaction must be the only one fetched, and it overrides older data.
-	f.history[3] = `[{"nevra":"fd-find-0:9.1.0-1.fc45.x86_64","action":"Install","repository":"copr:example"}]`
-	repos, err = loadReposWith(context.Background(), f.run)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(f.infoIDs[1], []string{"3"}) {
-		t.Fatalf("second scan queried %v, want only [3]", f.infoIDs[1])
-	}
-	if got := repos["fd-find.x86_64|9.1.0-1.fc45"]; got != "copr:example" {
-		t.Fatalf("fd-find 9.1.0 repo = %q, want newest %q", got, "copr:example")
+	if len(repos) != len(want) {
+		t.Fatalf("parsed %d origins, want %d: %v", len(repos), len(want), repos)
 	}
 
-	// Nothing new: no history info call at all.
-	if _, err := loadReposWith(context.Background(), f.run); err != nil {
-		t.Fatal(err)
+	if len(f.calls) != 1 {
+		t.Fatalf("made %d calls, want 1", len(f.calls))
 	}
-	if len(f.infoIDs) != 2 {
-		t.Fatalf("unchanged history made %d info calls, want 2", len(f.infoIDs))
+	call := f.calls[0]
+	if call.name != "dnf5" || !slices.Equal(call.args, []string{"repoquery", "--installed", "--queryformat", repoQueryFormat}) {
+		t.Fatalf("unexpected call: %s %v", call.name, call.args)
+	}
+}
+
+func TestLoadInstalledReposError(t *testing.T) {
+	wantErr := errors.New("dnf5 exploded")
+	f := &fakeRepoQuery{err: wantErr}
+
+	if _, err := loadInstalledReposWith(context.Background(), f.run); !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want %v", err, wantErr)
+	}
+}
+
+func TestMatchesRepository(t *testing.T) {
+	p := Package{Name: "example", Summary: "an example package", Repo: "copr:copr.fedorainfracloud.org:user:project"}
+	if !matches(p, "fedora") {
+		t.Fatal("search should match the origin repository")
+	}
+	p.Repo = ""
+	if matches(p, "fedora") {
+		t.Fatal("empty origin must not match any repository name")
+	}
+}
+
+func TestRepoQueryFormatMatchesRPMEVR(t *testing.T) {
+	// The key must stay in the name.arch|VERSION-RELEASE shape produced by the
+	// rpm scan, otherwise origins silently never match.
+	for _, tag := range []string{"%{name}.%{arch}|", "|%{version}-%{release}|", "|%{from_repo}\n"} {
+		if !strings.Contains(repoQueryFormat, tag) {
+			t.Fatalf("repoQueryFormat %q is missing %q", repoQueryFormat, tag)
+		}
+	}
+	if strings.Contains(repoQueryFormat, "epoch") {
+		t.Fatal("repoQueryFormat must omit the epoch to match rpm's EVR")
 	}
 }

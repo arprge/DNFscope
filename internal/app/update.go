@@ -13,6 +13,7 @@ type scanDoneMsg struct {
 	pkgs      []Package
 	fp        string
 	baseFound bool
+	withRepos bool
 	cached    bool
 	err       error
 }
@@ -37,6 +38,15 @@ type pane int
 const (
 	paneList pane = iota
 	paneDetails
+)
+
+type dragMode int
+
+const (
+	dragNone dragMode = iota
+	dragSplitWidth
+	dragStackHeight
+	dragOverviewHeight
 )
 
 func spinnerTick() tea.Cmd {
@@ -95,7 +105,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case depsDoneMsg:
-		m.depsLoading = ""
+		if m.depsLoading == msg.key {
+			m.depsLoading = ""
+		}
 		m.deps[msg.key] = msg.result
 		return m, nil
 
@@ -106,15 +118,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.cached {
+			// The cached list may predate the origin lookup, so start one now
+			// instead of pretending every package has an unknown origin.
+			if m.repoSource && !msg.withRepos {
+				m.repoLoading = true
+				m.repoLoaded = false
+				m.repoFailed = false
+				return m, loadRepoSources(m.all)
+			}
 			return m, nil
 		}
 		m.err = nil
 		m.all = msg.pkgs
 		m.fp = msg.fp
 		m.baseFound = msg.baseFound
+		m.repoLoaded = msg.withRepos
+		m.repoLoading = false
+		m.repoFailed = false
 		m.rebuildRows()
 		m.flash = true
-		return m, flashTick()
+		cmds := []tea.Cmd{flashTick()}
+		if m.repoSource && !msg.withRepos {
+			// The scan ran before origins were requested; fetch them now.
+			m.repoLoading = true
+			cmds = append(cmds, loadRepoSources(m.all))
+		}
+		return m, tea.Batch(cmds...)
 
 	case repoDoneMsg:
 		m.repoLoading = false
@@ -122,9 +151,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.err != nil {
+			m.repoLoaded = false
+			m.repoFailed = true
 			m.notice = "repo lookup failed"
 			return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return clearNoticeMsg(m.notice) })
 		}
+		m.repoFailed = false
+		m.repoLoaded = true
 		for i := range msg.pkgs {
 			p := &msg.pkgs[i]
 			p.Repo = msg.repos[p.Name+"."+p.Arch+"|"+p.EVR]
@@ -140,6 +173,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m model) toggleDependencies(mode dependencyMode) (model, tea.Cmd) {
+	p, ok := m.selected()
+	if !ok {
+		return m, nil
+	}
+	key := packageKey(p)
+	if m.depsMode == mode {
+		m.depsMode = dependencyNone
+		m.depsOffset = 0
+		return m, nil
+	}
+	m.depsMode = mode
+	m.depsOffset = 0
+	if _, cached := m.deps[key]; cached || m.depsLoading == key {
+		return m, nil
+	}
+	m.depsLoading = key
+	return m, loadDependencies(p)
+}
+
 func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if m.help || m.searching {
 		return m, nil
@@ -150,7 +203,7 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if msg.Button == tea.MouseButtonWheelUp {
 			delta = -1
 		}
-		if m.showDeps && m.focused == paneDetails {
+		if m.depsMode != dependencyNone && m.focused == paneDetails {
 			m.moveDependencies(delta)
 		} else {
 			m.move(delta)
@@ -160,14 +213,17 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 	if msg.Action == tea.MouseActionRelease {
 		m.dragging = false
+		m.dragMode = dragNone
 		return m, nil
 	}
 	if msg.Action == tea.MouseActionMotion && m.dragging {
-		switch m.lay.mode {
-		case modeSplit:
+		switch m.dragMode {
+		case dragSplitWidth:
 			m.splitW = m.width - msg.X
-		case modeStack:
+		case dragStackHeight:
 			m.stackDetailH = m.lay.avail - (msg.Y - m.contentStartY())
+		case dragOverviewHeight:
+			m.overviewH = m.lay.avail - (msg.Y - m.contentStartY())
 		}
 		m.resize(m.width, m.height)
 		return m, nil
@@ -178,25 +234,35 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 	switch m.lay.mode {
 	case modeSplit:
+		boundaryY := m.contentStartY() + m.lay.detH
+		if m.lay.ovH > 0 && msg.X >= m.lay.listW && abs(msg.Y-boundaryY) <= 1 {
+			m.dragging = true
+			m.dragMode = dragOverviewHeight
+			return m, nil
+		}
 		if abs(msg.X-m.lay.listW) <= 1 {
 			m.dragging = true
+			m.dragMode = dragSplitWidth
 			return m, nil
 		}
 		if msg.X < m.lay.listW {
 			m.focused = paneList
 		} else {
 			m.focused = paneDetails
+			return m.toggleDependencies(dependencyRequires)
 		}
 	case modeStack:
 		boundaryY := m.contentStartY() + m.lay.listH
 		if abs(msg.Y-boundaryY) <= 1 {
 			m.dragging = true
+			m.dragMode = dragStackHeight
 			return m, nil
 		}
 		if msg.Y < boundaryY {
 			m.focused = paneList
 		} else {
 			m.focused = paneDetails
+			return m.toggleDependencies(dependencyRequires)
 		}
 	default:
 		m.focused = paneList
@@ -243,68 +309,55 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, copyPackageName(p.Name)
 
 	case "r":
-		p, ok := m.selected()
-		if !ok {
-			return m, nil
-		}
-		key := packageKey(p)
-		if m.showDeps && m.depsLoading != key {
-			m.showDeps = false
-			m.depsOffset = 0
-			return m, nil
-		}
-		m.showDeps = true
-		m.depsOffset = 0
-		if _, cached := m.deps[key]; cached || m.depsLoading == key {
-			return m, nil
-		}
-		m.depsLoading = key
-		return m, loadDependencies(key)
+		return m.toggleDependencies(dependencyRequires)
+
+	case "R":
+		return m.toggleDependencies(dependencyRequiredBy)
 
 	case "up", "k":
-		if m.showDeps {
+		if m.depsMode != dependencyNone {
 			m.moveDependencies(-1)
 		} else {
 			m.move(-1)
 		}
 	case "down", "j":
-		if m.showDeps {
+		if m.depsMode != dependencyNone {
 			m.moveDependencies(1)
 		} else {
 			m.move(1)
 		}
 	case "ctrl+u":
-		if m.showDeps {
+		if m.depsMode != dependencyNone {
 			m.moveDependencies(-max(1, m.lay.detH-2))
 		} else {
 			m.move(-max(1, m.lay.bodyH/2))
 		}
 	case "ctrl+d":
-		if m.showDeps {
+		if m.depsMode != dependencyNone {
 			m.moveDependencies(max(1, m.lay.detH-2))
 		} else {
 			m.move(max(1, m.lay.bodyH/2))
 		}
 	case "pgup", "ctrl+b":
-		if m.showDeps {
+		if m.depsMode != dependencyNone {
 			m.moveDependencies(-max(1, m.lay.detH-2))
 		} else {
 			m.move(-max(1, m.lay.bodyH))
 		}
 	case "pgdown", "ctrl+f":
-		if m.showDeps {
+		if m.depsMode != dependencyNone {
 			m.moveDependencies(max(1, m.lay.detH-2))
 		} else {
 			m.move(max(1, m.lay.bodyH))
 		}
 	case "g":
-		if m.showDeps {
+		if m.depsMode != dependencyNone {
 			m.jumpDependencies(false)
 		} else {
 			m.jump(0)
 		}
 	case "G":
-		if m.showDeps {
+		if m.depsMode != dependencyNone {
 			m.jumpDependencies(true)
 		} else {
 			m.jump(len(m.visible) - 1)
@@ -352,10 +405,18 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "o":
 		m.repoSource = !m.repoSource
-		if m.repoSource && len(m.all) > 0 {
-			m.repoLoading = true
+		m.repoFailed = false
+		if !m.repoSource {
+			m.repoLoading = false
+			return m, nil
+		}
+		m.repoLoaded = false
+		m.repoLoading = true
+		if len(m.all) > 0 {
 			return m, loadRepoSources(m.all)
 		}
+		// A scan is still running; scanDoneMsg starts the lookup afterwards.
+		return m, nil
 
 	case "i":
 		m.icons = !m.icons

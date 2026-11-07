@@ -48,7 +48,7 @@ func boolInt(b bool) int {
 	return 0
 }
 
-func computeLayout(w, h int, icons bool, splitW, stackDetailH int) layout {
+func computeLayout(w, h int, icons bool, splitW, stackDetailH, overviewH int) layout {
 	if w < minWidth {
 		w = minWidth
 	}
@@ -72,7 +72,10 @@ func computeLayout(w, h int, icons bool, splitW, stackDetailH int) layout {
 		l.listH = l.avail
 		l.detH = l.avail
 		if l.avail >= 18 {
-			l.ovH = 7
+			if overviewH == 0 {
+				overviewH = 7
+			}
+			l.ovH = clamp(overviewH, 4, l.avail-6)
 			l.detH = l.avail - l.ovH
 		}
 	case l.avail >= 14:

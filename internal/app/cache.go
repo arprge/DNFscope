@@ -10,22 +10,11 @@ import (
 // Bump when derived detection rules change, even if the JSON shape does not.
 const cacheSchema = 5
 
-// Bump when the repo history record shape or derivation changes.
-const repoHistorySchema = 1
-
 type cacheFile struct {
 	Schema      int       `json:"schema"`
 	Fingerprint string    `json:"fingerprint"`
 	BaseFound   bool      `json:"base_found"`
 	Packages    []Package `json:"packages"`
-}
-
-// repoHistory remembers which repository installed each build, so scans only
-// query dnf5 transactions newer than LastID.
-type repoHistory struct {
-	Schema int               `json:"schema"`
-	LastID int               `json:"last_id"`
-	Repos  map[string]string `json:"repos"`
 }
 
 func cacheDir() (string, error) {
@@ -71,32 +60,6 @@ func writeCache(cf *cacheFile) error {
 		return err
 	}
 	return writeJSONAtomic(path, cf)
-}
-
-// readRepoHistory returns nil when the record is missing or stale; callers then
-// rebuild from the full dnf5 history.
-func readRepoHistory() *repoHistory {
-	dir, err := cacheDir()
-	if err != nil {
-		return nil
-	}
-	b, err := os.ReadFile(filepath.Join(dir, "repos.json"))
-	if err != nil {
-		return nil
-	}
-	var rh repoHistory
-	if err := json.Unmarshal(b, &rh); err != nil || rh.Schema != repoHistorySchema || rh.Repos == nil {
-		return nil
-	}
-	return &rh
-}
-
-func writeRepoHistory(rh *repoHistory) error {
-	dir, err := cacheDir()
-	if err != nil {
-		return err
-	}
-	return writeJSONAtomic(filepath.Join(dir, "repos.json"), rh)
 }
 
 func writeJSONAtomic(path string, v any) error {
