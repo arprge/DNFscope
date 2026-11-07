@@ -22,7 +22,7 @@ func RunList(w io.Writer) error {
 		fromCache = true
 	} else {
 		var err error
-		pkgs, baseFound, err = buildPackages(context.Background(), false)
+		pkgs, baseFound, _, err = buildPackages(context.Background(), false)
 		if err != nil {
 			return err
 		}

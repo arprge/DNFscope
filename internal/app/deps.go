@@ -11,9 +11,40 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+type dependencyMode int
+
+const (
+	dependencyNone dependencyMode = iota
+	dependencyRequires
+	dependencyRequiredBy
+)
+
+func (m dependencyMode) String() string {
+	switch m {
+	case dependencyRequires:
+		return "requires"
+	case dependencyRequiredBy:
+		return "required by"
+	default:
+		return "none"
+	}
+}
+
 type dependencyResult struct {
-	lines []string
-	err   error
+	requires   []string
+	requiredBy []string
+	err        error
+}
+
+func (r dependencyResult) lineCount(mode dependencyMode) int {
+	switch mode {
+	case dependencyRequires:
+		return len(r.requires) + 1
+	case dependencyRequiredBy:
+		return len(r.requiredBy) + 1
+	default:
+		return 0
+	}
 }
 
 type depsDoneMsg struct {
@@ -25,19 +56,56 @@ func packageKey(p Package) string {
 	return p.Name + "." + p.Arch
 }
 
-// loadDependencies reads the requirements of the installed package itself.
-// Querying rpm avoids dnf repoquery selecting an available, different version.
-func loadDependencies(key string) tea.Cmd {
+// loadDependencies reads the selected package's requires and reverse
+// dependencies. Querying rpm avoids dnf repoquery selecting an available,
+// different version. Reverse dependencies cover direct name and architecture
+// capability consumers, not every soname consumer.
+func loadDependencies(p Package) tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		key := packageKey(p)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 
 		out, err := exec.CommandContext(ctx, "rpm", "-q", "--requires", key).Output()
 		if err != nil {
 			return depsDoneMsg{key: key, result: dependencyResult{err: fmt.Errorf("rpm requirements: %w", err)}}
 		}
-		return depsDoneMsg{key: key, result: dependencyResult{lines: parseDependencies(string(out))}}
+		result := dependencyResult{requires: parseDependencies(string(out))}
+
+		// Reverse dependencies are the installed packages that require this
+		// package's name or architecture capability. rpm's whatrequires does
+		// not match soname consumers through the package name, which is an
+		// acceptable direct-dependency view and avoids fan-out queries.
+		names := []string{p.Name}
+		if p.Arch == "x86_64" || p.Arch == "i686" {
+			names = append(names, p.Name+"(x86-64)")
+		}
+		reverse, _ := exec.CommandContext(ctx, "rpm", append([]string{"-q", "--whatrequires"}, names...)...).Output()
+		result.requiredBy = parseRequiredBy(string(reverse), key)
+		return depsDoneMsg{key: key, result: result}
 	}
+}
+
+func parseRequiredBy(output, selfKey string) []string {
+	seen := make(map[string]struct{})
+	var dependents []string
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "no package requires ") {
+			continue
+		}
+		key := nevraKey(line)
+		if key == "" || key == selfKey {
+			continue
+		}
+		if _, ok := seen[line]; ok {
+			continue
+		}
+		seen[line] = struct{}{}
+		dependents = append(dependents, line)
+	}
+	sort.Strings(dependents)
+	return dependents
 }
 
 func parseDependencies(output string) []string {

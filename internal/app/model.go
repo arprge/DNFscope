@@ -16,11 +16,15 @@ type model struct {
 	lay           layout
 	focused       pane
 	dragging      bool
+	dragMode      dragMode
 	splitW        int
 	stackDetailH  int
+	overviewH     int
 	icons         bool
 	repoSource    bool
 	repoLoading   bool
+	repoLoaded    bool
+	repoFailed    bool
 
 	cursor int
 	offset int
@@ -44,7 +48,7 @@ type model struct {
 	flash   bool
 	notice  string
 
-	showDeps    bool
+	depsMode    dependencyMode
 	depsLoading string
 	depsOffset  int
 	deps        map[string]dependencyResult
@@ -96,7 +100,7 @@ func refreshCmd(oldFP string, hasData, includeRepos bool) tea.Cmd {
 			return scanDoneMsg{fp: fp, cached: true}
 		}
 
-		pkgs, baseFound, err := buildPackages(context.Background(), includeRepos)
+		pkgs, baseFound, withRepos, err := buildPackages(context.Background(), includeRepos)
 		if err != nil {
 			return scanDoneMsg{err: err, fp: fp}
 		}
@@ -106,20 +110,20 @@ func refreshCmd(oldFP string, hasData, includeRepos bool) tea.Cmd {
 			BaseFound:   baseFound,
 			Packages:    pkgs,
 		})
-		return scanDoneMsg{pkgs: pkgs, fp: fp, baseFound: baseFound}
+		return scanDoneMsg{pkgs: pkgs, fp: fp, baseFound: baseFound, withRepos: withRepos}
 	}
 }
 
 func loadRepoSources(pkgs []Package) tea.Cmd {
 	return func() tea.Msg {
-		repos, err := loadRepos(context.Background())
+		repos, err := loadInstalledRepos(context.Background())
 		return repoDoneMsg{pkgs: pkgs, repos: repos, err: err}
 	}
 }
 
 func (m *model) resize(width, height int) {
 	m.width, m.height = width, height
-	m.lay = computeLayout(width, height, m.icons, m.splitW, m.stackDetailH)
+	m.lay = computeLayout(width, height, m.icons, m.splitW, m.stackDetailH, m.overviewH)
 	if m.lay.mode == modeSplit {
 		m.splitW = m.lay.detW
 	} else if m.lay.mode == modeStack {
@@ -218,7 +222,7 @@ func (m *model) moveDependencies(delta int) {
 		return
 	}
 	page := max(1, m.lay.detH-2)
-	maxOffset := max(0, len(result.lines)-page)
+	maxOffset := max(0, result.lineCount(m.depsMode)-page)
 	m.depsOffset = clamp(m.depsOffset+delta, 0, maxOffset)
 }
 
@@ -233,7 +237,7 @@ func (m *model) jumpDependencies(end bool) {
 	}
 	result, ok := m.deps[packageKey(p)]
 	if ok {
-		m.depsOffset = max(0, len(result.lines)-max(1, m.lay.detH-2))
+		m.depsOffset = max(0, result.lineCount(m.depsMode)-max(1, m.lay.detH-2))
 	}
 }
 
@@ -282,7 +286,8 @@ func (m *model) cycleSort() {
 
 func matches(p Package, q string) bool {
 	if strings.Contains(strings.ToLower(p.Name), q) ||
-		strings.Contains(strings.ToLower(p.Summary), q) {
+		strings.Contains(strings.ToLower(p.Summary), q) ||
+		strings.Contains(strings.ToLower(p.Repo), q) {
 		return true
 	}
 	for _, c := range p.Commands {

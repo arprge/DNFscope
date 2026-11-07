@@ -175,9 +175,8 @@ type histInfo struct {
 	RPMDBBegin  string `json:"rpmdb_version_begin"`
 	Status      string `json:"status"`
 	Packages    []struct {
-		NEVRA      string `json:"nevra"`
-		Action     string `json:"action"`
-		Repository string `json:"repository"`
+		NEVRA  string `json:"nevra"`
+		Action string `json:"action"`
 	} `json:"packages"`
 }
 
@@ -300,90 +299,42 @@ func addBaseNames(base map[string]struct{}, info histInfo) {
 	}
 }
 
-// loadRepos maps name.arch|EVR to the repository that most recently installed
-// that build. Removals and replacements carry no source and are skipped.
-func loadRepos(ctx context.Context) (map[string]string, error) {
-	return loadReposWith(ctx, runCmd)
+// repoQueryFormat yields the same name.arch|VERSION-RELEASE key that the rpm
+// scan uses, plus the repository the installed build originally came from.
+// %{version}-%{release} deliberately omits the epoch, matching rpm's EVR here.
+const repoQueryFormat = "%{name}.%{arch}|%{version}-%{release}|%{from_repo}\n"
+
+// loadInstalledRepos maps name.arch|EVR to the repository that installed that
+// build. libdnf5 stores the origin per installed package, so one repoquery call
+// replaces walking the entire transaction history. This is also more complete:
+// packages whose history was rotated away still report their origin.
+func loadInstalledRepos(ctx context.Context) (map[string]string, error) {
+	return loadInstalledReposWith(ctx, runCmd)
 }
 
-// loadReposWith asks dnf5 only for transactions newer than the cached LastID.
-// History is append-only, so a steady-state scan costs one "history list" call.
-func loadReposWith(ctx context.Context, run commandRunner) (map[string]string, error) {
-	out, err := run(ctx, "dnf5", "history", "list", "--json")
+func loadInstalledReposWith(ctx context.Context, run commandRunner) (map[string]string, error) {
+	out, err := run(ctx, "dnf5", "repoquery", "--installed", "--queryformat", repoQueryFormat)
 	if err != nil {
 		return nil, err
 	}
-	var list []struct {
-		ID int `json:"id"`
-	}
-	if err := json.Unmarshal(out, &list); err != nil {
-		return nil, err
-	}
-	maxID := 0
-	for _, t := range list {
-		maxID = max(maxID, t.ID)
-	}
-
-	rh := readRepoHistory()
-	if rh == nil || rh.LastID > maxID {
-		// History was rotated or reset, so the cached IDs no longer apply.
-		rh = &repoHistory{Schema: repoHistorySchema, Repos: map[string]string{}}
-	}
-	args := []string{"history", "info"}
-	for _, t := range list {
-		if t.ID > rh.LastID {
-			args = append(args, strconv.Itoa(t.ID))
+	repos := make(map[string]string, 4096)
+	sc := bufio.NewScanner(bytes.NewReader(out))
+	for sc.Scan() {
+		line := sc.Text()
+		sep := strings.LastIndexByte(line, '|')
+		if sep <= 0 {
+			continue // package ids and repoids never contain a bare '|'
 		}
-	}
-	if len(args) == 2 {
-		return rh.Repos, nil
-	}
-
-	out, err = run(ctx, "dnf5", append(args, "--json")...)
-	if err != nil {
-		return nil, err
-	}
-	var infos []histInfo
-	if err := json.Unmarshal(out, &infos); err != nil {
-		return nil, err
-	}
-	sort.Slice(infos, func(i, j int) bool { return infos[i].ID > infos[j].ID })
-
-	// Newest transaction first, so the first install of a build is its source.
-	fresh := make(map[string]string)
-	for _, info := range infos {
-		for _, p := range info.Packages {
-			switch p.Action {
-			case "Install", "Upgrade", "Downgrade", "Reinstall":
-			default:
-				continue
-			}
-			if p.Repository == "" || strings.HasPrefix(p.Repository, "@") {
-				continue
-			}
-			key := repoKey(p.NEVRA)
-			if _, seen := fresh[key]; key != "" && !seen {
-				fresh[key] = p.Repository
-			}
+		repo := line[sep+1:]
+		if repo == "" || strings.HasPrefix(repo, "@") {
+			continue // @System/@commandline are not real origins
 		}
+		repos[line[:sep]] = repo
 	}
-	for k, v := range fresh {
-		rh.Repos[k] = v
+	if err := sc.Err(); err != nil {
+		return nil, err
 	}
-	rh.LastID = maxID
-	_ = writeRepoHistory(rh) // a failed write only costs a refetch next scan
-	return rh.Repos, nil
-}
-
-// repoKey turns a history NEVRA into the same name.arch|EVR form that rpm
-// reports, so an installed package can be matched to the transaction that
-// installed exactly that build.
-func repoKey(nevra string) string {
-	m := nevraRe.FindStringSubmatch(nevra)
-	if m == nil {
-		return ""
-	}
-	return m[1] + "." + m[4] + "|" + m[2] + "-" + m[3]
+	return repos, nil
 }
 
 func nevraKey(nevra string) string {
@@ -393,11 +344,13 @@ func nevraKey(nevra string) string {
 	return ""
 }
 
-// buildPackages scans the rpmdb once and keeps only packages the user asked for.
-func buildPackages(ctx context.Context, includeRepos bool) ([]Package, bool, error) {
+// buildPackages scans the rpmdb once and keeps only packages the user asked
+// for. withRepos reports whether the origin lookup ran successfully, so callers
+// can distinguish "not loaded yet" from a package with no known origin.
+func buildPackages(ctx context.Context, includeRepos bool) ([]Package, bool, bool, error) {
 	reasons, err := loadReasons()
 	if err != nil {
-		return nil, false, fmt.Errorf("read packages.toml: %w", err)
+		return nil, false, false, fmt.Errorf("read packages.toml: %w", err)
 	}
 
 	base, baseFound, err := loadBaseNames(ctx)
@@ -406,32 +359,32 @@ func buildPackages(ctx context.Context, includeRepos bool) ([]Package, bool, err
 		baseFound = false
 	}
 
-	var repos map[string]string
 	if includeRepos {
 		// The repo lookup is independent of the rpm scan, so overlap them. A
 		// failed lookup only hides the repo row.
-		reposCh := make(chan map[string]string, 1)
+		type repoResult struct {
+			repos map[string]string
+			ok    bool
+		}
+		reposCh := make(chan repoResult, 1)
 		go func() {
-			repos, err := loadRepos(ctx)
-			if err != nil {
-				repos = nil
-			}
-			reposCh <- repos
+			repos, err := loadInstalledRepos(ctx)
+			reposCh <- repoResult{repos: repos, ok: err == nil}
 		}()
 
-		pkgs, err := scanRPM(ctx, reasons, base)
-		repos = <-reposCh
+		pkgs, err := scanRPM(ctx, reasons, base, baseFound)
+		res := <-reposCh
 		if err != nil {
-			return nil, baseFound, err
+			return nil, baseFound, false, err
 		}
-		return finishPackages(pkgs, repos), baseFound, nil
+		return finishPackages(pkgs, res.repos), baseFound, res.ok, nil
 	}
 
-	pkgs, err := scanRPM(ctx, reasons, base)
+	pkgs, err := scanRPM(ctx, reasons, base, baseFound)
 	if err != nil {
-		return nil, baseFound, err
+		return nil, baseFound, false, err
 	}
-	return finishPackages(pkgs, nil), baseFound, nil
+	return finishPackages(pkgs, nil), baseFound, false, nil
 }
 
 func finishPackages(pkgs []Package, repos map[string]string) []Package {
@@ -476,7 +429,7 @@ func isSystemComponent(name string) bool {
 	return ok
 }
 
-func scanRPM(ctx context.Context, reasons map[string]string, base map[string]struct{}) ([]Package, error) {
+func scanRPM(ctx context.Context, reasons map[string]string, base map[string]struct{}, baseFound bool) ([]Package, error) {
 	cctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
@@ -490,7 +443,7 @@ func scanRPM(ctx context.Context, reasons map[string]string, base map[string]str
 		return nil, fmt.Errorf("start rpm: %w", err)
 	}
 
-	out, scanErr := parseRPM(stdout, reasons, base, executableFile)
+	out, scanErr := parseRPM(stdout, reasons, base, baseFound, executableFile)
 	// A parser error may leave rpm blocked writing to its pipe.
 	if scanErr != nil {
 		cancel()
@@ -505,7 +458,7 @@ func scanRPM(ctx context.Context, reasons map[string]string, base map[string]str
 	return out, nil
 }
 
-func parseRPM(r io.Reader, reasons map[string]string, base map[string]struct{}, executable func(string) bool) ([]Package, error) {
+func parseRPM(r io.Reader, reasons map[string]string, base map[string]struct{}, baseFound bool, executable func(string) bool) ([]Package, error) {
 	out := make([]Package, 0, 256)
 	idx := -1 // index of the package currently receiving files
 	sc := bufio.NewScanner(r)
@@ -534,7 +487,16 @@ func parseRPM(r io.Reader, reasons map[string]string, base map[string]struct{}, 
 			continue
 		}
 		key := f[0] + "." + f[1]
-		if !isUserReason(reasons[key]) {
+		reason, tracked := reasons[key]
+		// An installed row absent from packages.toml can be an explicitly
+		// installed package that libdnf5 never recorded. Recover it without an
+		// extra query, but only when the baseline proves it is not part of the
+		// image; RPM metadata alone cannot tell this from an ordinary base
+		// package here.
+		if !tracked && baseFound && !isBase(base, key) && f[0] != "gpg-pubkey" {
+			reason = "Untracked"
+		}
+		if !isUserReason(reason) && reason != "Untracked" {
 			idx = -1
 			continue
 		}
@@ -548,7 +510,7 @@ func parseRPM(r io.Reader, reasons map[string]string, base map[string]struct{}, 
 			InstallTime: time.Unix(installed, 0),
 			Summary:     f[5],
 			URL:         f[6],
-			Reason:      reasons[key],
+			Reason:      reason,
 			FromBase:    isBase(base, key),
 		})
 		idx = len(out) - 1

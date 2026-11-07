@@ -374,10 +374,6 @@ func (m model) detailPanel(w, h int, active bool) []string {
 	if !ok {
 		return panel("Details", "", w, h, active, []string{centered(inner, "nothing selected", theme.overlay0, bg)})
 	}
-	if m.showDeps {
-		return m.dependenciesPanel(p, w, h, active)
-	}
-
 	accent := kindColor(p.KindLabel())
 	head := " " + paint(theme.text, bg).Bold(true).Render(p.Name) +
 		paint(theme.overlay1, bg).Render(" "+p.EVR)
@@ -409,9 +405,12 @@ func (m model) detailPanel(w, h int, active bool) []string {
 	)
 	if m.repoSource {
 		repository := p.Repo
-		if m.repoLoading {
+		switch {
+		case m.repoFailed:
+			repository = "lookup failed"
+		case m.repoLoading || !m.repoLoaded:
 			repository = "loading…"
-		} else if repository == "" {
+		case repository == "":
 			repository = "unknown"
 		}
 		lines = append(lines, kv("installed from", repository, text, inner))
@@ -419,44 +418,79 @@ func (m model) detailPanel(w, h int, active bool) []string {
 	if p.URL != "" {
 		lines = append(lines, kv("url", p.URL, paint(theme.sapphire, bg), inner))
 	}
+	if m.depsMode != dependencyNone {
+		lines = append(lines, m.relationshipLines(p, inner, max(0, h-2-len(lines)))...)
+	}
 	return panel("Details", "", w, h, active, lines)
 }
 
-func (m model) dependenciesPanel(p Package, w, h int, active bool) []string {
+func (m model) relationshipLines(p Package, inner, avail int) []string {
 	bg := theme.base
-	inner := w - 2
 	key := packageKey(p)
-	if m.depsLoading == key {
-		return panel("Requirements", "loading…", w, h, active, []string{
-			centered(inner, "reading installed package requirements…", theme.overlay0, bg),
-		})
+	requiresSelected := m.depsMode == dependencyRequires
+	title := "▸ requires"
+	color := theme.accent
+	pressHint := " (press r)"
+	if !requiresSelected {
+		title = "▸ required by"
+		color = theme.sapphire
+		pressHint = " (press R)"
 	}
-	result, ok := m.deps[key]
-	if !ok {
-		return panel("Requirements", "", w, h, active, []string{
-			centered(inner, "select this package and press r", theme.overlay0, bg),
-		})
+	sectionTitle := func(count int) string {
+		return " " + paint(color, bg).Bold(true).Render(fmt.Sprintf("%s (%d)", title, count))
 	}
-	if result.err != nil {
-		return panel("Requirements", "error", w, h, active, []string{
-			" " + paint(theme.red, bg).Render(result.err.Error()),
-		})
+	loadingTitle := " " + paint(color, bg).Bold(true).Render(title)
+	row := func(value string, rowColor lipgloss.Color, arrow string) string {
+		return "  " + paint(rowColor, bg).Render(arrow) + " " + paint(theme.subtext0, bg).Render(value)
 	}
-	if len(result.lines) == 0 {
-		return panel("Requirements", "0", w, h, active, []string{
-			centered(inner, "no non-RPM-library requirements", theme.overlay0, bg),
-		})
+	arrow := "→"
+	rowColor := theme.text
+	if !requiresSelected {
+		arrow = "←"
+		rowColor = theme.sapphire
 	}
 
-	page := max(1, h-2)
-	offset := clamp(m.depsOffset, 0, max(0, len(result.lines)-page))
-	end := min(len(result.lines), offset+page)
-	lines := make([]string, 0, end-offset)
-	for _, requirement := range result.lines[offset:end] {
-		lines = append(lines, "  "+paint(theme.text, bg).Render(requirement))
+	var relationLines []string
+	if m.depsLoading == key {
+		relationLines = []string{
+			loadingTitle,
+			"  " + paint(theme.overlay0, bg).Render("loading…"),
+		}
+	} else if result, ok := m.deps[key]; ok {
+		if result.err != nil {
+			relationLines = []string{" " + paint(theme.red, bg).Render(result.err.Error())}
+		} else {
+			values := result.requires
+			if !requiresSelected {
+				values = result.requiredBy
+			}
+			relationLines = append(relationLines, sectionTitle(len(values)))
+			if len(values) == 0 {
+				relationLines = append(relationLines, row("none", theme.overlay0, "─"))
+			} else {
+				for _, value := range values {
+					relationLines = append(relationLines, row(value, rowColor, arrow))
+				}
+			}
+		}
+	} else {
+		relationLines = []string{
+			loadingTitle + paint(theme.overlay0, bg).Render(pressHint),
+		}
 	}
-	right := fmt.Sprintf("%d–%d / %d", offset+1, end, len(result.lines))
-	return panel("Requirements", right, w, h, active, lines)
+
+	page := max(1, avail)
+	offset := clamp(m.depsOffset, 0, max(0, len(relationLines)-page))
+	end := min(len(relationLines), offset+page)
+	out := make([]string, 0, end-offset)
+	if offset > 0 {
+		out = append(out, "  "+paint(theme.overlay0, bg).Render(fmt.Sprintf("↑ %d more above", offset)))
+	}
+	out = append(out, relationLines[offset:end]...)
+	if end < len(relationLines) && len(out) < page {
+		out = append(out, "  "+paint(theme.overlay0, bg).Render(fmt.Sprintf("↓ %d more below", len(relationLines)-end)))
+	}
+	return out
 }
 
 // --- overview ------------------------------------------------------------
@@ -541,7 +575,8 @@ func (m model) footerRow() string {
 			{"/", "search", false},
 			{"tab", "type", false},
 			{"c", "copy name", false},
-			{"r", "requires", m.showDeps},
+			{"r", "requires", m.depsMode == dependencyRequires},
+			{"R", "required by", m.depsMode == dependencyRequiredBy},
 			{"?", "help", false},
 			{"s", "sort", false},
 			{"a", "all", m.filters.AllUser},
@@ -610,11 +645,12 @@ func (m model) helpPanel(h int) []string {
 		row("/", "search · esc clears"),
 		row("s  S", "cycle sort · reverse"),
 		row("c", "copy selected package name"),
-		row("r", "requirements · arrows scroll"),
+		row("r", "requires in details · arrows scroll"),
+		row("R", "required by in details · arrows scroll"),
 		row("a", "include non-tool packages"),
 		row("b", "include base image"),
 		row("d", "include -devel / -doc"),
-		row("o", "load repository origins (slower)"),
+		row("o", "show package origin repository"),
 
 		row("i", "toggle icons"),
 		row("q", "quit"),

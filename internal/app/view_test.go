@@ -87,9 +87,9 @@ func TestViewFitsTerminalStates(t *testing.T) {
 		"flash":   func(m *model) { m.flash = true },
 		"error":   func(m *model) { m.err = errors.New("boom") },
 		"requirements": func(m *model) {
-			m.showDeps = true
+			m.depsMode = dependencyRequires
 			p, _ := m.selected()
-			m.deps[packageKey(p)] = dependencyResult{lines: []string{"glibc >= 2.38", "libxkbcommon.so.0()(64bit)"}}
+			m.deps[packageKey(p)] = dependencyResult{requires: []string{"glibc >= 2.38", "libxkbcommon.so.0()(64bit)"}, requiredBy: []string{"other-1.0-1.fc45.x86_64"}}
 		},
 	}
 	for name, mutate := range states {
@@ -110,25 +110,135 @@ func TestViewFitsTerminalStates(t *testing.T) {
 
 func TestDetailPanelShowsInstallRepository(t *testing.T) {
 	for _, test := range []struct {
-		name string
-		repo string
+		name    string
+		repo    string
+		loading bool
+		loaded  bool
+		failed  bool
+		want    string
 	}{
-		{name: "known", repo: "fedora"},
-		{name: "unknown"},
+		{name: "known", repo: "fedora", loaded: true, want: "fedora"},
+		{name: "unknown", loaded: true, want: "unknown"},
+		{name: "loading", loading: true, want: "loading…"},
+		{name: "not loaded yet", want: "loading…"},
+		{name: "lookup failed", failed: true, want: "lookup failed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			m := baseModel(false)
 			m.loading = false
 			m.repoSource = true
+			m.repoLoading = test.loading
+			m.repoLoaded = test.loaded
+			m.repoFailed = test.failed
 			m.all = []Package{{Name: "example", Arch: "x86_64", EVR: "1.0", Repo: test.repo, Commands: []string{"example"}}}
 			m.rebuildRows()
 
 			lines := strings.Join(m.detailPanel(80, 20, false), "\n")
 			plain := ansi.Strip(lines)
-			if !strings.Contains(plain, "installed") || !strings.Contains(plain, test.repo) {
-				t.Fatalf("detail panel does not show install source %q:\n%s", test.repo, plain)
+			if !strings.Contains(plain, "installed from") || !strings.Contains(plain, test.want) {
+				t.Fatalf("detail panel does not show install source %q:\n%s", test.want, plain)
+			}
+			if test.want != "unknown" && strings.Contains(plain, "installed from") && strings.Contains(plain, "unknown") {
+				t.Fatalf("detail panel falsely reports an unknown origin:\n%s", plain)
 			}
 		})
+	}
+}
+
+func TestDetailPanelShowsDependencySections(t *testing.T) {
+	for _, mode := range []dependencyMode{dependencyRequires, dependencyRequiredBy} {
+		t.Run(mode.String(), func(t *testing.T) {
+			m := baseModel(false)
+			m.loading = false
+			m.depsMode = mode
+			m.all = []Package{{Name: "example", Arch: "x86_64", EVR: "1.0", Commands: []string{"example"}}}
+			m.rebuildRows()
+			m.deps["example.x86_64"] = dependencyResult{
+				requires:   []string{"glibc >= 2.38"},
+				requiredBy: []string{"other-1.0-1.fc45.x86_64"},
+			}
+
+			plain := ansi.Strip(strings.Join(m.detailPanel(80, 20, false), "\n"))
+			want := []string{"Details", "requires", "glibc >= 2.38"}
+			hidden := []string{"required by", "other-1.0-1.fc45.x86_64"}
+			if mode == dependencyRequiredBy {
+				want = []string{"Details", "required by", "other-1.0-1.fc45.x86_64"}
+				hidden = []string{"requires", "glibc >= 2.38"}
+			}
+			for _, value := range want {
+				if !strings.Contains(plain, value) {
+					t.Fatalf("detail panel does not contain %q:\n%s", value, plain)
+				}
+			}
+			for _, value := range hidden {
+				if strings.Contains(plain, value) {
+					t.Fatalf("detail panel unexpectedly contains inactive section %q:\n%s", value, plain)
+				}
+			}
+		})
+	}
+}
+
+func TestShiftRSwapsDependencySections(t *testing.T) {
+	m := baseModel(false)
+	m.loading = false
+	m.all = []Package{{Name: "example", Arch: "x86_64", EVR: "1.0", Commands: []string{"example"}}}
+	m.rebuildRows()
+
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	m = next.(model)
+	if m.depsMode != dependencyRequiredBy {
+		t.Fatalf("shift+r mode=%v, want required by", m.depsMode)
+	}
+
+	next, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m = next.(model)
+	if m.depsMode != dependencyRequires {
+		t.Fatalf("r after required by mode=%v, want requires", m.depsMode)
+	}
+
+	next, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	m = next.(model)
+	if m.depsMode != dependencyRequiredBy {
+		t.Fatalf("shift+r after requires mode=%v, want required by", m.depsMode)
+	}
+
+	next, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	m = next.(model)
+	if m.depsMode != dependencyNone {
+		t.Fatalf("second shift+r mode=%v, want none", m.depsMode)
+	}
+}
+
+func TestRepoOriginLoadsAfterPendingScan(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	m := baseModel(false)
+	m.loading = true
+
+	// Toggling origins before the initial scan finishes must be remembered.
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	m = next.(model)
+	if !m.repoSource || !m.repoLoading || m.repoLoaded {
+		t.Fatalf("pending toggle: source=%v loading=%v loaded=%v", m.repoSource, m.repoLoading, m.repoLoaded)
+	}
+
+	pkgs := []Package{{Name: "fd-find", Arch: "x86_64", EVR: "9.1.0-1.fc45", Commands: []string{"fd"}}}
+	next, cmd := m.Update(scanDoneMsg{pkgs: pkgs, fp: "fp"})
+	m = next.(model)
+	if cmd == nil {
+		t.Fatal("scan completion should start the pending origin lookup")
+	}
+	if !m.repoLoading || m.repoLoaded {
+		t.Fatalf("after scan: loading=%v loaded=%v", m.repoLoading, m.repoLoaded)
+	}
+
+	next, _ = m.Update(repoDoneMsg{pkgs: m.all, repos: map[string]string{"fd-find.x86_64|9.1.0-1.fc45": "updates"}})
+	m = next.(model)
+	if !m.repoLoaded || m.repoLoading || m.repoFailed {
+		t.Fatalf("after lookup: loading=%v loaded=%v failed=%v", m.repoLoading, m.repoLoaded, m.repoFailed)
+	}
+	if got := m.all[0].Repo; got != "updates" {
+		t.Fatalf("repo = %q, want updates", got)
 	}
 }
 
@@ -177,18 +287,27 @@ func TestMouseFocusAndResize(t *testing.T) {
 	if m.lay.detW != oldDetailW+8 {
 		t.Fatalf("dragged detail width=%d, want %d", m.lay.detW, oldDetailW+8)
 	}
+	oldDetailH := m.lay.detH
+	oldOverviewH := m.lay.ovH
+	boundaryY := m.contentStartY() + m.lay.detH
+	applyMouse(tea.MouseMsg{X: m.lay.listW + 2, Y: boundaryY, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	applyMouse(tea.MouseMsg{X: m.lay.listW + 2, Y: boundaryY + 3, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
+	applyMouse(tea.MouseMsg{X: m.lay.listW + 2, Y: boundaryY + 3, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
+	if m.lay.detH != oldDetailH+3 || m.lay.ovH != oldOverviewH-3 {
+		t.Fatalf("dragged detail/overview heights=%d/%d, want %d/%d", m.lay.detH, m.lay.ovH, oldDetailH+3, oldOverviewH-3)
+	}
 
 	m.resize(60, 20)
 	if m.lay.mode != modeStack {
 		t.Fatalf("stack test mode=%v, want stack", m.lay.mode)
 	}
-	oldDetailH := m.lay.detH
-	boundaryY := m.contentStartY() + m.lay.listH
-	applyMouse(tea.MouseMsg{X: 10, Y: boundaryY, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
-	applyMouse(tea.MouseMsg{X: 10, Y: boundaryY - 2, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
-	applyMouse(tea.MouseMsg{X: 10, Y: boundaryY - 2, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
-	if m.lay.detH != oldDetailH+2 {
-		t.Fatalf("dragged detail height=%d, want %d", m.lay.detH, oldDetailH+2)
+	oldStackDetailH := m.lay.detH
+	stackBoundaryY := m.contentStartY() + m.lay.listH
+	applyMouse(tea.MouseMsg{X: 10, Y: stackBoundaryY, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	applyMouse(tea.MouseMsg{X: 10, Y: stackBoundaryY - 2, Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
+	applyMouse(tea.MouseMsg{X: 10, Y: stackBoundaryY - 2, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft})
+	if m.lay.detH != oldStackDetailH+2 {
+		t.Fatalf("dragged detail height=%d, want %d", m.lay.detH, oldStackDetailH+2)
 	}
 }
 
@@ -217,22 +336,30 @@ func TestParseDependencies(t *testing.T) {
 	}
 }
 
+func TestParseRequiredBy(t *testing.T) {
+	got := parseRequiredBy("no package requires example\nexample-1.0-1.fc45.x86_64\nconsumer-1.0-1.fc45.x86_64\nconsumer-1.0-1.fc45.x86_64\n", "example.x86_64")
+	want := []string{"consumer-1.0-1.fc45.x86_64"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("parseRequiredBy() = %q, want %q", got, want)
+	}
+}
+
 func TestDependencyScroll(t *testing.T) {
 	m := baseModel(false)
 	m.loading = false
 	m.all = []Package{{Name: "example", Arch: "x86_64", Commands: []string{"example"}}}
 	m.rebuildRows()
-	m.showDeps = true
+	m.depsMode = dependencyRequires
 	m.lay.detH = 4
-	m.deps["example.x86_64"] = dependencyResult{lines: []string{"one", "two", "three", "four"}}
+	m.deps["example.x86_64"] = dependencyResult{requires: []string{"one", "two", "three", "four"}}
 
 	m.moveDependencies(1)
 	if m.depsOffset != 1 {
 		t.Fatalf("dependencies offset=%d, want 1", m.depsOffset)
 	}
 	m.jumpDependencies(true)
-	if m.depsOffset != 2 {
-		t.Fatalf("end offset=%d, want 2", m.depsOffset)
+	if m.depsOffset != 3 {
+		t.Fatalf("end offset=%d, want 3", m.depsOffset)
 	}
 }
 
